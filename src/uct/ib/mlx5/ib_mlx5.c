@@ -1247,6 +1247,9 @@ void uct_ib_mlx5_txwq_validate_always(uct_ib_mlx5_txwq_t *wq, uint16_t num_bb,
 extern uct_tl_t UCT_TL_NAME(dc_mlx5);
 extern uct_tl_t UCT_TL_NAME(rc_mlx5);
 extern uct_tl_t UCT_TL_NAME(ud_mlx5);
+#ifdef HAVE_MRC
+extern uct_tl_t UCT_TL_NAME(mrc_mlx5);
+#endif
 
 extern uct_ib_md_ops_entry_t UCT_IB_MD_OPS_NAME(devx);
 extern uct_ib_md_ops_entry_t UCT_IB_MD_OPS_NAME(dv);
@@ -1269,10 +1272,16 @@ void UCS_F_CTOR uct_mlx5_init(void)
 #if defined (HAVE_TL_UD) && defined (HAVE_MLX5_HW_UD)
     uct_tl_register(&uct_ib_component, &UCT_TL_NAME(ud_mlx5));
 #endif
+#ifdef HAVE_MRC
+    uct_tl_register(&uct_ib_component, &UCT_TL_NAME(mrc_mlx5));
+#endif
 }
 
 void UCS_F_DTOR uct_mlx5_cleanup(void)
 {
+#ifdef HAVE_MRC
+    uct_tl_unregister(&UCT_TL_NAME(mrc_mlx5));
+#endif
 #if defined (HAVE_TL_UD) && defined (HAVE_MLX5_HW_UD)
     uct_tl_unregister(&UCT_TL_NAME(ud_mlx5));
 #endif

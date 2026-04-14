@@ -81,6 +81,18 @@ endif # HAVE_MLX5_HW_UD
 
 endif # HAVE_TL_UD
 
+if HAVE_MRC
+noinst_HEADERS += \
+	mrc/mrc_iface.h
+
+libuct_ib_mlx5_la_SOURCES += \
+	mrc/mrc_iface.c \
+	mrc/mrc_ep.c
+
+libuct_ib_mlx5_la_CPPFLAGS += $(MRC_CPPFLAGS)
+libuct_ib_mlx5_la_LDFLAGS  += $(MRC_LDFLAGS)
+endif # HAVE_MRC
+
 PKG_CONFIG_NAME=ib-mlx5
 
 include $(top_srcdir)/config/module.am
