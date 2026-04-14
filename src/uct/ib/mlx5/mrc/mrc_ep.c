@@ -60,6 +60,7 @@ UCS_CLASS_INIT_FUNC(uct_mrc_ep_t, const uct_ep_params_t *params)
     self->mrc_qp         = NULL;
     self->mrc_hint       = NULL;
     self->qp_num         = 0;
+    self->remote_qp_num  = 0;
     self->tx_outstanding = 0;
     ucs_arbiter_group_init(&self->arb_group);
     ucs_list_head_init(&self->flush_comp_list);
@@ -197,10 +198,28 @@ ucs_status_t uct_mrc_ep_get_address(uct_ep_h tl_ep, uct_ep_addr_t *addr)
 int uct_mrc_ep_is_connected(uct_ep_h tl_ep,
                               const uct_ep_is_connected_params_t *params)
 {
-    /* v1: simple check that the QP exists and has a non-zero QPN.
-     * A production implementation would verify QP state is RTS. */
-    uct_mrc_ep_t *ep = ucs_derived_of(tl_ep, uct_mrc_ep_t);
-    return ep->qp_num != 0;
+    uct_mrc_ep_t *ep   = ucs_derived_of(tl_ep, uct_mrc_ep_t);
+    union ibv_gid *rgid;
+
+    /* Require device_addr in params — matches the connect_to_ep_v2 path. */
+    UCT_EP_IS_CONNECTED_CHECK_DEV_ADDR(params);
+
+    /* remote_qp_num is set only after connect_to_ep_v2 completes (RTS). */
+    if (ep->remote_qp_num == 0) {
+        return 0;
+    }
+
+    /* If the caller supplies an EP address, verify it matches. */
+    if ((params->field_mask & UCT_EP_IS_CONNECTED_FIELD_EP_ADDR) &&
+        (((const uct_mrc_ep_addr_t *)params->ep_addr)->qp_num !=
+         ep->remote_qp_num)) {
+        return 0;
+    }
+
+    rgid = ep->remote_is_global ? &ep->remote_gid : NULL;
+    return uct_ib_iface_is_same_device(
+                (const uct_ib_address_t *)params->device_addr,
+                ep->remote_lid, rgid);
 }
 
 
@@ -291,6 +310,14 @@ uct_mrc_ep_connect_to_ep_v2(uct_ep_h tl_ep,
         return UCS_ERR_IO_ERROR;
     }
 
+    /* Record remote routing info for ep_is_connected validation. */
+    ep->remote_qp_num    = mrc_addr->qp_num;
+    ep->remote_lid       = ah_attr.dlid;
+    ep->remote_is_global = ah_attr.is_global;
+    if (ah_attr.is_global) {
+        ep->remote_gid = ah_attr.grh.dgid;
+    }
+
     ucs_debug("mrc_mlx5 EP %p: QP %u connected to remote QPN %u",
               ep, ep->qp_num, mrc_addr->qp_num);
     return UCS_OK;
@@ -313,6 +340,9 @@ ucs_status_t uct_mrc_ep_put_short(uct_ep_h tl_ep,
     struct ibv_send_wr *bad_wr;
 
     if (ucs_unlikely(ep->tx_outstanding >= (unsigned)iface->config.tx_queue_len)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
+    if (ucs_unlikely(iface->tx_outstanding >= (unsigned)iface->config.tx_queue_len)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -353,6 +383,10 @@ ssize_t uct_mrc_ep_put_bcopy(uct_ep_h tl_ep,
     size_t                packed;
 
     if (ucs_unlikely(ep->tx_outstanding >= (unsigned)iface->config.tx_queue_len)) {
+        UCT_TL_IFACE_STAT_TX_NO_DESC(&iface->super.super);
+        return (ssize_t)UCS_ERR_NO_RESOURCE;
+    }
+    if (ucs_unlikely(iface->tx_outstanding >= (unsigned)iface->config.tx_queue_len)) {
         UCT_TL_IFACE_STAT_TX_NO_DESC(&iface->super.super);
         return (ssize_t)UCS_ERR_NO_RESOURCE;
     }
@@ -411,6 +445,9 @@ ucs_status_t uct_mrc_ep_put_zcopy(uct_ep_h tl_ep,
     ucs_assert(iovcnt <= UCT_IB_MAX_IOV);
 
     if (ucs_unlikely(ep->tx_outstanding >= (unsigned)iface->config.tx_queue_len)) {
+        return UCS_ERR_NO_RESOURCE;
+    }
+    if (ucs_unlikely(iface->tx_outstanding >= (unsigned)iface->config.tx_queue_len)) {
         return UCS_ERR_NO_RESOURCE;
     }
 
@@ -502,17 +539,22 @@ ucs_status_t uct_mrc_ep_pending_add(uct_ep_h tl_ep,
 }
 
 
-/* Purge callback adapter for ucs_arbiter_group_purge. */
+/* Purge callback adapter for ucs_arbiter_group_purge.
+ * When arg is NULL (EP destructor path) elements are silently removed;
+ * when arg is a uct_purge_cb_args_t * (ep_pending_purge path) the user
+ * callback is invoked for each element. */
 static ucs_arbiter_cb_result_t
 uct_mrc_ep_purge_pending_cb(ucs_arbiter_t *arbiter,
                              ucs_arbiter_group_t *group,
                              ucs_arbiter_elem_t *elem,
                              void *arg)
 {
-    uct_purge_cb_args_t  *args = arg;
-    uct_pending_req_t    *req  = ucs_container_of(elem, uct_pending_req_t,
-                                                   arb_elem);
-    args->cb(req, args->arg);
+    uct_purge_cb_args_t *args = arg;
+    uct_pending_req_t   *req  = ucs_container_of(elem, uct_pending_req_t,
+                                                  arb_elem);
+    if (args != NULL) {
+        args->cb(req, args->arg);
+    }
     return UCS_ARBITER_CB_RESULT_REMOVE_ELEM;
 }
 

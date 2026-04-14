@@ -132,7 +132,11 @@ struct uct_mrc_ep {
     uct_base_ep_t       super;
     struct mrc_qp      *mrc_qp;
     struct mrc_qp_hint *mrc_hint;         /* per-EP hint (v1: one-to-one) */
-    uint32_t            qp_num;
+    uint32_t            qp_num;           /* local QPN */
+    uint32_t            remote_qp_num;    /* remote QPN; 0 until connect_to_ep_v2 */
+    uint16_t            remote_lid;       /* remote LID captured at connect time */
+    uint8_t             remote_is_global; /* non-zero if GID routing is used */
+    union ibv_gid       remote_gid;       /* remote GID; valid when remote_is_global */
     unsigned            tx_outstanding;   /* signaled sends in flight on this EP */
     ucs_arbiter_group_t arb_group;        /* pending-send group */
     ucs_list_link_t     flush_comp_list;  /* pending EP-level flush comps */

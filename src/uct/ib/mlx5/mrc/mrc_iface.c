@@ -142,6 +142,11 @@ uct_mrc_iface_destroy_cq(uct_ib_iface_t *ib_iface, uct_ib_dir_t dir)
 }
 
 
+/* Forward declaration: defined below, called by async_event_handler above. */
+static uct_mrc_ep_t *uct_mrc_iface_lookup_qp(uct_mrc_iface_t *iface,
+                                              struct mrc_qp *qp);
+
+
 /* ============================================================
  * Async event handler (registered on the device event channel)
  * ============================================================ */
@@ -291,30 +296,37 @@ unsigned uct_mrc_iface_progress(uct_iface_h tl_iface)
     for (i = 0; i < nc; i++) {
         uct_mrc_ep_t *ep;
 
-        ucs_assert(iface->tx_outstanding > 0);
-        iface->tx_outstanding--;
-
-        /* Decrement per-EP outstanding; fire EP flush completions if drained. */
         ep = uct_mrc_iface_lookup_qpn(iface, wc[i].qp_num);
-        if (ucs_likely(ep != NULL)) {
-            ucs_assert(ep->tx_outstanding > 0);
-            ep->tx_outstanding--;
-            if (ep->tx_outstanding == 0) {
-                uct_mrc_ep_invoke_pending_flush(ep);
-            }
-        }
 
+        /* Check CQE status before touching flush completions: an error CQE
+         * must not cause pending flush callbacks to fire with UCS_OK. */
         if (ucs_unlikely(wc[i].status != IBV_WC_SUCCESS)) {
             ucs_error("MRC TX error on " UCT_IB_IFACE_FMT
                       ": %s (wr_id=0x%lx qpn=%u)",
                       UCT_IB_IFACE_ARG(&iface->super),
                       ibv_wc_status_str(wc[i].status),
                       wc[i].wr_id, wc[i].qp_num);
+            ucs_assert(iface->tx_outstanding > 0);
+            iface->tx_outstanding--;
             if (ep != NULL) {
+                ucs_assert(ep->tx_outstanding > 0);
+                ep->tx_outstanding--;
                 uct_ib_handle_failure(&iface->super, ep,
                                       UCS_ERR_ENDPOINT_TIMEOUT);
             }
             continue;
+        }
+
+        ucs_assert(iface->tx_outstanding > 0);
+        iface->tx_outstanding--;
+
+        /* Decrement per-EP outstanding; fire EP flush completions if drained. */
+        if (ucs_likely(ep != NULL)) {
+            ucs_assert(ep->tx_outstanding > 0);
+            ep->tx_outstanding--;
+            if (ep->tx_outstanding == 0) {
+                uct_mrc_ep_invoke_pending_flush(ep);
+            }
         }
 
         if (wc[i].wr_id == 0) {
