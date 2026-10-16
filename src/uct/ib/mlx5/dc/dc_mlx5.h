@@ -188,6 +188,8 @@ typedef struct uct_dc_mlx5_iface_config {
     ucs_ternary_auto_value_t            dct_full_handshake;
     unsigned                            dct_affinity;
     unsigned                            quota;
+
+    int                                 sticky_dci;
     unsigned                            rand_seed;
     ucs_time_t                          fc_hard_req_timeout;
     uct_ud_mlx5_iface_common_config_t   mlx5_ud;
@@ -227,6 +229,9 @@ typedef struct uct_dc_dci {
     uint8_t                       next_channel_index; /* next DCI channel index
                                                          to be used by EP */
     uint8_t                       flags; /* See uct_dc_dci_flags_t */
+    /* STICKY_DCI: last ep to own this DCI (affinity hint only, never an
+     * ownership claim; the free-stack invariant still governs availability) */
+    uct_dc_mlx5_ep_t              *last_ep;
 } uct_dc_dci_t;
 
 
@@ -343,6 +348,9 @@ struct uct_dc_mlx5_iface {
         ucs_arbiter_callback_t       pend_cb;
 
         uint8_t                      dci_pool_release_bitmap;
+
+        /* STICKY_DCI: prefer re-granting an ep its last-released DCI (dcs*) */
+        uint8_t                      sticky_dci;
 
         uint8_t                      av_fl_mlid;
 

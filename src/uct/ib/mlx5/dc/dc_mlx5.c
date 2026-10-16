@@ -119,6 +119,12 @@ ucs_config_field_t uct_dc_mlx5_iface_config_sub_table[] = {
      "Seed for DCI allocation when \"rand\" dci policy is used (0 - use default).",
      ucs_offsetof(uct_dc_mlx5_iface_config_t, rand_seed), UCS_CONFIG_TYPE_UINT},
 
+    {"STICKY_DCI", "no",
+     "For dcs/dcs_quota policies, prefer re-granting an endpoint the DCI it\n"
+     "released most recently, to keep the DCI<->DCT connection state hot\n"
+     "and avoid repeated DC re-establishment on the device.",
+     ucs_offsetof(uct_dc_mlx5_iface_config_t, sticky_dci), UCS_CONFIG_TYPE_BOOL},
+
     {"QUOTA", "32",
      "When \"dcs_quota\" policy is selected, how much to send from a DCI when\n"
      "there are other endpoints waiting for it.",
@@ -1685,6 +1691,9 @@ static UCS_CLASS_INIT_FUNC(uct_dc_mlx5_iface_t, uct_md_h tl_md, uct_worker_h wor
 
     self->tx.policy = config->tx_policy;
     self->tx.ndci   = uct_dc_mlx5_iface_is_hw_dcs(self) ? 1 : config->ndci;
+    self->tx.sticky_dci = config->sticky_dci &&
+                          !uct_dc_mlx5_iface_is_policy_shared(self) &&
+                          !uct_dc_mlx5_iface_is_dci_rand(self);
 
     if (config->dcis_initial_capacity == UCS_ULUNITS_AUTO) {
         max_capacity = uct_dc_mlx5_iface_is_dci_rand(self) ? SIZE_MAX : 0;

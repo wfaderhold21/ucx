@@ -84,6 +84,8 @@ struct uct_dc_mlx5_ep {
     uct_dc_mlx5_base_av_t av;
     uint8_t               atomic_mr_id;
     uint8_t               dci_channel_index;
+    uct_dci_index_t       sticky_dci; /* STICKY_DCI: last DCI released by
+                                         this ep, preferred on next alloc */
 };
 
 typedef struct {
@@ -447,6 +449,7 @@ uct_dc_mlx5_ep_basic_init(uct_dc_mlx5_iface_t *iface, uct_dc_mlx5_ep_t *ep)
     uct_dc_dci_t *dci;
 
     ucs_arbiter_group_init(&ep->arb_group);
+    ep->sticky_dci = UCT_DC_MLX5_EP_NO_DCI;
 
     if ((uct_dc_mlx5_iface_is_hw_dcs(iface) ||
          uct_dc_mlx5_iface_is_hybrid(iface)) &&
@@ -675,6 +678,11 @@ uct_dc_mlx5_iface_dci_put(uct_dc_mlx5_iface_t *iface, uct_dci_index_t dci_index)
     ep->dci    = UCT_DC_MLX5_EP_NO_DCI;
     ep->flags &= ~UCT_DC_MLX5_EP_FLAG_TX_WAIT;
 
+    if (iface->tx.sticky_dci) {
+        uct_dc_mlx5_iface_dci(iface, dci_index)->last_ep = ep;
+        ep->sticky_dci = dci_index;
+    }
+
     uct_dc_mlx5_iface_dci(iface, dci_index)->ep = NULL;
 
     /* it is possible that dci is released while ep still has scheduled pending ops.
@@ -682,6 +690,51 @@ uct_dc_mlx5_iface_dci_put(uct_dc_mlx5_iface_t *iface, uct_dci_index_t dci_index)
      */
     ucs_arbiter_group_desched(uct_dc_mlx5_iface_tx_waitq(iface), &ep->arb_group);
     uct_dc_mlx5_iface_schedule_dci_alloc(iface, ep);
+}
+
+/* STICKY_DCI: if the DCI this ep last released is sitting in its pool's
+ * free region, swap it to the pop position so the ep gets it back. Keeping
+ * an ep on the same DCI keeps the DCI<->DCT connection state hot on the
+ * device; stock LIFO reassignment rebinds DCIs across DCTs and forces the
+ * HW to re-establish DC connections per op (rx_dct_connect churn).
+ * The caller then pops stack_top as usual, picking up the sticky DCI. */
+static UCS_F_ALWAYS_INLINE void
+uct_dc_mlx5_iface_sticky_dci_take(uct_dc_mlx5_iface_t *iface,
+                                  uct_dc_mlx5_ep_t *ep)
+{
+    uint8_t pool_index           = uct_dc_mlx5_ep_pool_index(ep);
+    uct_dc_mlx5_dci_pool_t *pool = &iface->tx.dci_pool[pool_index];
+    uct_dci_index_t dci_index    = ep->sticky_dci;
+    uct_dci_index_t i, free_i    = UCT_DC_MLX5_EP_NO_DCI;
+    uint8_t len                  = ucs_array_length(&pool->stack);
+
+    if (!iface->tx.sticky_dci || (dci_index == UCT_DC_MLX5_EP_NO_DCI) ||
+        (dci_index >= len) ||
+        (uct_dc_mlx5_iface_dci(iface, dci_index)->last_ep != ep)) {
+        return;
+    }
+
+    /* DCI must be in the free region [stack_top, len) and unowned */
+    if (uct_dc_mlx5_ep_from_dci(iface, dci_index) != NULL) {
+        return;
+    }
+
+    for (i = pool->stack_top; i < len; ++i) {
+        if (ucs_array_elem(&pool->stack, i) == dci_index) {
+            free_i = i;
+            break;
+        }
+    }
+
+    if (free_i == UCT_DC_MLX5_EP_NO_DCI) {
+        return;
+    }
+
+    ucs_trace_data("iface %p: sticky re-grant dci %d to ep %p", iface,
+                   dci_index, ep);
+    ucs_array_elem(&pool->stack, free_i) =
+            ucs_array_elem(&pool->stack, pool->stack_top);
+    ucs_array_elem(&pool->stack, pool->stack_top) = dci_index;
 }
 
 static inline void
@@ -695,6 +748,9 @@ uct_dc_mlx5_iface_dci_alloc(uct_dc_mlx5_iface_t *iface, uct_dc_mlx5_ep_t *ep)
     uct_dc_mlx5_dci_pool_t *pool = &iface->tx.dci_pool[pool_index];
 
     ucs_assert(!uct_dc_mlx5_iface_is_policy_shared(iface));
+    if (ucs_unlikely(iface->tx.sticky_dci)) {
+        uct_dc_mlx5_iface_sticky_dci_take(iface, ep);
+    }
     ucs_assert(pool->release_stack_top < pool->stack_top);
     ucs_assertv(pool->stack_top < ucs_array_length(&pool->stack),
                 "stack_top=%u, array_length(stack)=%u", pool->stack_top,
@@ -708,6 +764,7 @@ uct_dc_mlx5_iface_dci_alloc(uct_dc_mlx5_iface_t *iface, uct_dc_mlx5_ep_t *ep)
         (void)uct_dc_mlx5_ep_qp_to_err(ep);
     }
 
+    uct_dc_mlx5_iface_dci(iface, ep->dci)->last_ep = ep;
     ucs_assertv(pool->stack_top > 0, "dci pool overflow, stack_top=%d",
                 (int)pool->stack_top);
     ucs_trace_data("iface %p: allocate dci %d for ep %p", iface, ep->dci, ep);
@@ -756,6 +813,11 @@ uct_dc_mlx5_iface_dci_detach(uct_dc_mlx5_iface_t *iface, uct_dc_mlx5_ep_t *ep)
     uct_dc_mlx5_iface_dci_schedule_release(iface, dci_index);
 
 out_detach:
+    if (iface->tx.sticky_dci) {
+        uct_dc_mlx5_iface_dci(iface, dci_index)->last_ep = ep;
+        ep->sticky_dci = dci_index;
+    }
+
     ep->dci    = UCT_DC_MLX5_EP_NO_DCI;
     ep->flags &= ~UCT_DC_MLX5_EP_FLAG_TX_WAIT;
 

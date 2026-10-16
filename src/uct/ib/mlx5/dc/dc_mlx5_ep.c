@@ -1460,6 +1460,10 @@ UCS_CLASS_CLEANUP_FUNC(uct_dc_mlx5_ep_t)
                                   UCS_ERR_CANCELED, dci->txwq.sw_pi, 1);
     ucs_assert(ucs_queue_is_empty(&dci->txqp.outstanding));
     uct_dc_mlx5_iface_dci(iface, self->dci)->ep = NULL;
+    if (iface->tx.sticky_dci &&
+        (uct_dc_mlx5_iface_dci(iface, self->dci)->last_ep == self)) {
+        uct_dc_mlx5_iface_dci(iface, self->dci)->last_ep = NULL;
+    }
 }
 
 UCS_CLASS_DEFINE(uct_dc_mlx5_ep_t, uct_base_ep_t);
