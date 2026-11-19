@@ -313,6 +313,13 @@ uct_xrc_verbs_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
     /* Both the initiator and the target QP number are published. */
     iface_attr->ep_addr_len = sizeof(uct_xrc_verbs_ep_flush_addr_t);
 
+    /* The address of the interface names the node it is on, which is how an
+     * endpoint finds the shared initiator QP of its peer's node. The width is
+     * the one the device address needs, which is the whole content. */
+    iface_attr->iface_addr_len = ucs_min(
+            iface->super.super.addr_size,
+            (uint8_t)UCT_XRC_VERBS_IFACE_ADDR_MAX);
+
     return UCS_OK;
 }
 
@@ -497,6 +504,7 @@ uct_xrc_verbs_iface_create_tgt_qp(uct_xrc_verbs_iface_t *iface,
         }
     }
 
+    ++iface->num_tgt_qps;
     *qp_p = qp;
     return UCS_OK;
 }
@@ -798,6 +806,7 @@ uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
     }
 
     ++nqp->refcount;
+    nqp->max_refs = ucs_max(nqp->max_refs, nqp->refcount);
     *nqp_p = nqp;
     return UCS_OK;
 }
@@ -820,6 +829,45 @@ void uct_xrc_verbs_node_qp_release(uct_xrc_verbs_node_qp_t *nqp)
     if (nqp->txcnt.pi == nqp->txcnt.ci) {
         uct_xrc_verbs_node_qp_destroy(nqp);
     }
+}
+
+/* Report what the interface ended up using, which is the measurement of the QP
+ * model: with SHARED_INI=y the initiator QPs are the remote nodes, and every
+ * endpoint to one of them is a reference on the QP of that node. */
+static void uct_xrc_verbs_iface_log_qp_usage(uct_xrc_verbs_iface_t *iface)
+{
+    uct_xrc_verbs_iface_t *self = iface;
+    uct_xrc_verbs_node_qp_t *nqp;
+    char refs[192];
+    unsigned shared, total;
+    size_t off;
+
+    shared = total = 0;
+    off    = 0;
+    ucs_list_for_each(nqp, &self->node_qps, list) {
+        if (!nqp->shared) {
+            continue;
+        }
+
+        off += snprintf(refs + off, sizeof(refs) - off, "%s%u", (shared ? "," : ""),
+                        nqp->max_refs);
+        off  = ucs_min(off, sizeof(refs) - 1);
+        total += nqp->max_refs;
+        ++shared;
+    }
+
+    ucs_info("%s: iface %p ib addr_size %u iface_addr_length %u",
+             uct_ib_device_name(uct_ib_iface_device(&self->super.super)), self,
+             (unsigned)self->super.super.addr_size,
+             (unsigned)iface->super.super.addr_size);
+    ucs_info("%s: iface %p QP model: %u target QPs, %u shared initiator QPs "
+             "(peak endpoints served per QP: %s, %u in total), ep decisions: "
+             "%u shared, %u declined by config, %u no peer dev addr, %u "
+             "address not unpackable",
+             uct_ib_device_name(uct_ib_iface_device(&self->super.super)), self,
+             self->num_tgt_qps, shared, (shared ? refs : "none"), total,
+             self->ep_shared, self->ep_priv_cfg, self->ep_priv_addr,
+             self->ep_priv_unpack);
 }
 
 static void uct_xrc_verbs_node_qp_cleanup_all(uct_xrc_verbs_iface_t *iface)
@@ -897,6 +945,11 @@ static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
     self->config.shared_ini   = config->shared_ini;
     ucs_list_head_init(&self->node_qps);
     self->last_tx_nqp         = NULL;
+    self->num_tgt_qps         = 0;
+    self->ep_shared           = 0;
+    self->ep_priv_cfg         = 0;
+    self->ep_priv_addr        = 0;
+    self->ep_priv_unpack      = 0;
     self->super.config.tx_moderation = ucs_min(self->super.config.tx_moderation,
                                                self->config.tx_max_wr / 4);
     self->super.config.fence_mode =
@@ -989,6 +1042,7 @@ static UCS_CLASS_CLEANUP_FUNC(uct_xrc_verbs_iface_t)
     uct_base_iface_progress_disable(&self->super.super.super.super,
                                     UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
 
+    uct_xrc_verbs_iface_log_qp_usage(self);
     uct_xrc_verbs_node_qp_cleanup_all(self);
     uct_rc_iface_cleanup_qps(&self->super);
 
@@ -1004,6 +1058,22 @@ static UCS_CLASS_DEFINE_NEW_FUNC(uct_xrc_verbs_iface_t, uct_iface_t, uct_md_h,
                                  uct_worker_h, const uct_iface_params_t*,
                                  const uct_iface_config_t*);
 static UCS_CLASS_DEFINE_DELETE_FUNC(uct_xrc_verbs_iface_t, uct_iface_t);
+
+/* Publish the address of the device and port of this interface, which is what
+ * names the node it belongs to to a peer creating an endpoint. UCP does not
+ * always pass the device address of the peer to uct_ep_create(), but it always
+ * passes the interface address. */
+static ucs_status_t
+uct_xrc_verbs_iface_get_address(uct_iface_h tl_iface, uct_iface_addr_t *iface_addr)
+{
+    uct_xrc_verbs_iface_t *iface     = ucs_derived_of(tl_iface,
+                                                      uct_xrc_verbs_iface_t);
+    uct_xrc_verbs_iface_addr_t *addr = (uct_xrc_verbs_iface_addr_t*)iface_addr;
+
+    uct_ib_iface_address_pack(&iface->super.super,
+                              (uct_ib_address_t*)addr->raw);
+    return UCS_OK;
+}
 
 static uct_iface_ops_t uct_xrc_verbs_iface_tl_ops = {
     .ep_am_short              = uct_xrc_verbs_ep_am_short,
@@ -1042,8 +1112,7 @@ static uct_iface_ops_t uct_xrc_verbs_iface_tl_ops = {
     .iface_event_arm          = uct_rc_iface_event_arm,
     .iface_close              = UCS_CLASS_DELETE_FUNC_NAME(uct_xrc_verbs_iface_t),
     .iface_query              = uct_xrc_verbs_iface_query,
-    .iface_get_address        = (uct_iface_get_address_func_t)
-                                ucs_empty_function_return_success,
+    .iface_get_address        = uct_xrc_verbs_iface_get_address,
     .iface_get_device_address = uct_ib_iface_get_device_address,
     .iface_is_reachable       = uct_base_iface_is_reachable,
 };

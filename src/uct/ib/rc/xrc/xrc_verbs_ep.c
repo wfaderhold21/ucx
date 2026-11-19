@@ -872,6 +872,7 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
     uct_xrc_verbs_iface_t *iface = ucs_derived_of(params->iface,
                                                   uct_xrc_verbs_iface_t);
     uct_xrc_verbs_node_key_t key, *key_p = NULL;
+    const uct_ib_address_t *ib_addr;
     struct ibv_ah_attr ah_attr;
     enum ibv_mtu path_mtu;
     ucs_status_t status;
@@ -881,21 +882,45 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
      * shared receive queue itself, so the QP only fixes the node. The address
      * of the peer names it, and it is known here because UCP passes it. With
      * SHARED_INI=n no key is given, and the endpoint gets a QP of its own. */
-    if (iface->config.shared_ini &&
-        (params->field_mask & UCT_EP_PARAM_FIELD_DEV_ADDR) &&
-        (params->dev_addr != NULL)) {
-        status = uct_ib_iface_fill_ah_attr_from_addr(
-                &iface->super.super, params->dev_addr,
-                (params->field_mask & UCT_EP_PARAM_FIELD_PATH_INDEX) ?
-                        params->path_index : 0, &ah_attr, &path_mtu);
-        if (status == UCS_OK) {
-            key.gid = ah_attr.grh.dgid;
-            key.lid = ah_attr.dlid;
-            key_p   = &key;
+    if (!iface->config.shared_ini) {
+        ++iface->ep_priv_cfg;
+    } else {
+        /* Which of the two addresses the peer is named by depends on how the
+         * upper layer created this endpoint: the device address when UCP
+         * passes it, and otherwise the interface address, which this
+         * transport packs the device and port address into. */
+        if ((params->field_mask & UCT_EP_PARAM_FIELD_DEV_ADDR) &&
+            (params->dev_addr != NULL)) {
+            ib_addr = (const uct_ib_address_t*)params->dev_addr;
+        } else if ((params->field_mask & UCT_EP_PARAM_FIELD_IFACE_ADDR) &&
+                   (params->iface_addr != NULL)) {
+            ib_addr = (const uct_ib_address_t*)
+                    ((const uct_xrc_verbs_iface_addr_t*)
+                     params->iface_addr)->raw;
         } else {
-            ucs_trace("ep %p: cannot unpack the address of the peer, use an "
-                      "initiator QP of its own", self);
+            ib_addr = NULL;
+        }
+
+        if (ib_addr == NULL) {
+            ++iface->ep_priv_addr;
             status = UCS_OK;
+        } else {
+            status = uct_ib_iface_fill_ah_attr_from_addr(
+                    &iface->super.super, ib_addr,
+                    (params->field_mask & UCT_EP_PARAM_FIELD_PATH_INDEX) ?
+                            params->path_index : 0, &ah_attr, &path_mtu);
+            if (status == UCS_OK) {
+                key.gid = ah_attr.grh.dgid;
+                key.lid = ah_attr.dlid;
+                key_p   = &key;
+                ++iface->ep_shared;
+            } else {
+                ucs_trace("ep %p: cannot unpack the address of the peer (%s), "
+                          "use an initiator QP of its own", self,
+                          ucs_status_string(status));
+                ++iface->ep_priv_unpack;
+                status = UCS_OK;
+            }
         }
     }
 

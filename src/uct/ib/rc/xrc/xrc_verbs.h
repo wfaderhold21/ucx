@@ -140,6 +140,7 @@ typedef struct uct_xrc_verbs_node_qp {
     int                               retired;   /* no user, draining CQEs      */
     int                               stale_eps; /* its endpoints are gone      */
     unsigned                          max_eps;   /* endpoints it can serve      */
+    unsigned                          max_refs;  /* peak simultaneous users     */
     uct_xrc_verbs_txcnt_t             txcnt;     /* send queue of the QP       */
     uct_ib_fence_info_t               fi;        /* fence state of the QP      */
     uct_xrc_verbs_ep_t              **eps;       /* endpoints in post order    */
@@ -192,6 +193,20 @@ typedef struct uct_xrc_verbs_iface_config {
  * which every target QP of this interface is bound to, so all active messages
  * of all endpoints of the interface are delivered through one receive queue.
  */
+/* Interface address: the address of the device and port of the interface, so
+ * that an endpoint can tell which node its peer lives on already when it is
+ * created. UCP does not always pass the device address of the peer to
+ * uct_ep_create(), but it always passes the interface address, so this is the
+ * channel the shared initiator QP is keyed on. */
+typedef struct {
+    /* uct_ib_address_t is a variable-length placeholder type, so the bytes are
+     * held here at their full width and cast when used. */
+    uint8_t                 raw[32];
+} UCS_S_PACKED uct_xrc_verbs_iface_addr_t;
+
+#define UCT_XRC_VERBS_IFACE_ADDR_MAX sizeof(uct_xrc_verbs_iface_addr_t)
+
+
 typedef struct uct_xrc_verbs_iface {
     uct_rc_iface_t              super;
     struct ibv_xrcd            *xrcd;
@@ -201,6 +216,11 @@ typedef struct uct_xrc_verbs_iface {
     char                        xrcd_path[256];
     ucs_list_link_t             node_qps;     /* shared initiator QPs          */
     uct_xrc_verbs_node_qp_t    *last_tx_nqp;  /* cache for send completions    */
+    unsigned                    num_tgt_qps;  /* target QPs created, for stats */
+    unsigned                    ep_shared;    /* eps given a shared initiator  */
+    unsigned                    ep_priv_cfg;  /* eps declined by the config    */
+    unsigned                    ep_priv_addr; /* eps without a peer dev addr   */
+    unsigned                    ep_priv_unpack;/* eps whose address was opaque */
     struct ibv_send_wr          inl_am_wr;
     struct ibv_send_wr          inl_rwrite_wr;
     struct ibv_sge              inl_sge[UCT_IB_MAX_IOV];
