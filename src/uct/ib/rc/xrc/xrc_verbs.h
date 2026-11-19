@@ -217,6 +217,8 @@ typedef struct uct_xrc_verbs_iface {
     ucs_list_link_t             node_qps;     /* shared initiator QPs          */
     uct_xrc_verbs_node_qp_t    *last_tx_nqp;  /* cache for send completions    */
     unsigned                    num_tgt_qps;  /* target QPs created, for stats */
+    unsigned                    nqp_shared_created; /* shared QPs ever created */
+    unsigned                    nqp_shared_refs;    /* peak users of one of them */
     unsigned                    ep_shared;    /* eps given a shared initiator  */
     unsigned                    ep_priv_cfg;  /* eps declined by the config    */
     unsigned                    ep_priv_addr; /* peer address present but null */

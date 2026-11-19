@@ -527,6 +527,36 @@ ucp_rsc_index_t ucp_wireup_ep_get_aux_rsc_index(uct_ep_h uct_ep)
     return wireup_ep->aux_rsc_index;
 }
 
+/* The address the peer was reached at for one resource, if the peer reported
+ * one. A transport which pools one queue between all the endpoints to a node
+ * needs to know which node an endpoint is for at the moment it is created,
+ * because it publishes the number of that queue in its own endpoint address,
+ * and the peer connects its side to that number. The information is already
+ * here, only the endpoint parameters did not carry it. */
+static const ucp_address_entry_t*
+ucp_wireup_ep_peer_address(ucp_worker_h worker, ucp_rsc_index_t rsc_index,
+                           const ucp_unpacked_address_t *remote_address)
+{
+    const ucp_context_h context = worker->context;
+    const ucp_address_entry_t *address;
+    unsigned i;
+
+    if (remote_address == NULL) {
+        return NULL;
+    }
+
+    for (i = 0; i < remote_address->address_count; ++i) {
+        address = &remote_address->address_list[i];
+        if ((address->md_index == context->tl_rscs[rsc_index].md_index) &&
+            (address->tl_name_csum ==
+             context->tl_rscs[rsc_index].tl_name_csum)) {
+            return address;
+        }
+    }
+
+    return NULL;
+}
+
 ucs_status_t ucp_wireup_ep_connect(uct_ep_h uct_ep, unsigned ep_init_flags,
                                    ucp_rsc_index_t rsc_index,
                                    unsigned path_index, int connect_aux,
@@ -536,6 +566,7 @@ ucs_status_t ucp_wireup_ep_connect(uct_ep_h uct_ep, unsigned ep_init_flags,
     ucp_ep_h ucp_ep                = wireup_ep->super.ucp_ep;
     ucp_worker_h worker            = ucp_ep->worker;
     uct_ep_params_t uct_ep_params;
+    const ucp_address_entry_t *peer_address;
     ucs_status_t status;
     uct_ep_h next_ep;
 
@@ -545,6 +576,18 @@ ucs_status_t ucp_wireup_ep_connect(uct_ep_h uct_ep, unsigned ep_init_flags,
                                UCT_EP_PARAM_FIELD_PATH_INDEX;
     uct_ep_params.path_index = path_index;
     uct_ep_params.iface      = ucp_worker_iface(worker, rsc_index)->iface;
+
+    peer_address = ucp_wireup_ep_peer_address(worker, rsc_index,
+                                             remote_address);
+    if (peer_address != NULL) {
+        uct_ep_params.field_mask |= UCT_EP_PARAM_FIELD_DEV_ADDR |
+                                    UCT_EP_PARAM_FIELD_IFACE_ADDR;
+        uct_ep_params.dev_addr          = peer_address->dev_addr;
+        uct_ep_params.dev_addr_length   = peer_address->dev_addr_len;
+        uct_ep_params.iface_addr        = peer_address->iface_addr;
+        uct_ep_params.iface_addr_length = peer_address->iface_addr_len;
+    }
+
     status = uct_ep_create(&uct_ep_params, &next_ep);
     if (status != UCS_OK) {
         /* make Coverity happy */

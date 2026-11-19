@@ -800,6 +800,7 @@ uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
 
     if (key != NULL) {
         nqp->shared = 1;
+        ++iface->nqp_shared_created;
         nqp->key    = *key;
         ucs_debug("iface %p share initiator QP 0x%x with all endpoints to the "
                   "same remote node", iface, nqp->qpn);
@@ -807,6 +808,7 @@ uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
 
     ++nqp->refcount;
     nqp->max_refs = ucs_max(nqp->max_refs, nqp->refcount);
+    iface->nqp_shared_refs = ucs_max(iface->nqp_shared_refs, nqp->max_refs);
     *nqp_p = nqp;
     return UCS_OK;
 }
@@ -861,11 +863,13 @@ static void uct_xrc_verbs_iface_log_qp_usage(uct_xrc_verbs_iface_t *iface)
              (unsigned)self->super.super.addr_size,
              (unsigned)iface->super.super.addr_size);
     ucs_info("%s: iface %p QP model: %u target QPs, %u shared initiator QPs "
-             "(peak endpoints served per QP: %s, %u in total), ep decisions: "
+             "alive / %u created (peak endpoints served by one: %u, live peak "
+             "sum %u), ep decisions: "
              "%u shared, %u declined by config, %u peer address null, %u "
              "address not unpackable, %u field not passed",
              uct_ib_device_name(uct_ib_iface_device(&self->super.super)), self,
-             self->num_tgt_qps, shared, (shared ? refs : "none"), total,
+             self->num_tgt_qps, shared, self->nqp_shared_created,
+             self->nqp_shared_refs, total,
              self->ep_shared, self->ep_priv_cfg, self->ep_priv_addr,
              self->ep_priv_unpack, self->ep_priv_mask);
 }
@@ -946,6 +950,8 @@ static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
     ucs_list_head_init(&self->node_qps);
     self->last_tx_nqp         = NULL;
     self->num_tgt_qps         = 0;
+    self->nqp_shared_created  = 0;
+    self->nqp_shared_refs     = 0;
     self->ep_shared           = 0;
     self->ep_priv_cfg         = 0;
     self->ep_priv_addr        = 0;
