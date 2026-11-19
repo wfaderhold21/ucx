@@ -2169,7 +2169,8 @@ ucp_wireup_connect_lane_to_ep(ucp_ep_h ep, unsigned ep_init_flags,
                               ucp_lane_index_t lane, unsigned path_index,
                               ucp_rsc_index_t rsc_index,
                               ucp_worker_iface_t *wiface,
-                              const ucp_unpacked_address_t *remote_address)
+                              const ucp_unpacked_address_t *remote_address,
+                              const ucp_address_entry_t *address)
 {
     int connect_aux;
     uct_ep_h uct_ep;
@@ -2195,7 +2196,7 @@ ucp_wireup_connect_lane_to_ep(ucp_ep_h ep, unsigned ep_init_flags,
                   (lane == ucp_ep_get_wireup_msg_lane(ep));
     status      = ucp_wireup_ep_connect(ucp_ep_get_lane(ep, lane), ep_init_flags,
                                         rsc_index, path_index, connect_aux,
-                                        remote_address);
+                                        remote_address, address);
     if (status != UCS_OK) {
         return status;
     }
@@ -2236,7 +2237,10 @@ ucp_wireup_connect_lane(ucp_ep_h ep, unsigned ep_init_flags,
     if (ucp_ep_is_lane_p2p(ep, lane)) {
         return ucp_wireup_connect_lane_to_ep(ep, ep_init_flags, lane,
                                              path_index, rsc_index, wiface,
-                                             remote_address);
+                                             remote_address,
+                                             (remote_address != NULL) ?
+                                             &remote_address->address_list[addr_index] :
+                                             NULL);
     } else if (ucp_worker_is_tl_2iface(worker, rsc_index)) {
         address = &remote_address->address_list[addr_index];
         return ucp_wireup_connect_lane_to_iface(ep, lane, path_index, wiface,

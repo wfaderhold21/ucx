@@ -566,7 +566,8 @@ ucp_wireup_ep_peer_address(ucp_worker_h worker, ucp_rsc_index_t rsc_index,
 ucs_status_t ucp_wireup_ep_connect(uct_ep_h uct_ep, unsigned ep_init_flags,
                                    ucp_rsc_index_t rsc_index,
                                    unsigned path_index, int connect_aux,
-                                   const ucp_unpacked_address_t *remote_address)
+                                   const ucp_unpacked_address_t *remote_address,
+                                   const ucp_address_entry_t *address)
 {
     ucp_wireup_ep_t *wireup_ep     = ucp_wireup_ep(uct_ep);
     ucp_ep_h ucp_ep                = wireup_ep->super.ucp_ep;
@@ -583,8 +584,14 @@ ucs_status_t ucp_wireup_ep_connect(uct_ep_h uct_ep, unsigned ep_init_flags,
     uct_ep_params.path_index = path_index;
     uct_ep_params.iface      = ucp_worker_iface(worker, rsc_index)->iface;
 
-    peer_address = ucp_wireup_ep_peer_address(worker, rsc_index,
-                                             remote_address);
+    /* The caller which selected this lane knows which address entry of the
+     * peer the lane was selected for; use it. The search below is only for
+     * callers which have no remote address at all, and it stays out of the way
+     * rather than guessing a port when the entry is unknown: an entry of
+     * another interface names another port and the lane never comes up. */
+    peer_address = (address != NULL) ? address :
+                   ucp_wireup_ep_peer_address(worker, rsc_index,
+                                              remote_address);
     if (peer_address != NULL) {
         uct_ep_params.field_mask |= UCT_EP_PARAM_FIELD_DEV_ADDR |
                                     UCT_EP_PARAM_FIELD_IFACE_ADDR;

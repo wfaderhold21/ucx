@@ -85,7 +85,7 @@ static ucs_config_field_t uct_xrc_verbs_iface_config_table[] = {
    ucs_offsetof(uct_xrc_verbs_iface_config_t, domain_shared),
    UCS_CONFIG_TYPE_BOOL},
 
-  {"SHARED_INI", "y",
+  {"SHARED_INI", "n",
    "Share one XRC initiator QP between all endpoints which send to the same\n"
    "remote node. An XRC work request names the destination shared receive\n"
    "queue itself, so one initiator QP can serve every process of a node, which\n"

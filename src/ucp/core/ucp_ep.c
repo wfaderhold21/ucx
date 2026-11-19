@@ -1900,7 +1900,8 @@ ucp_ep_recovery_set_next_ep(ucp_ep_h ep, ucp_lane_index_t lane,
 
     if (ae == NULL) {
         ucs_assert(ucp_ep_is_lane_p2p(ep, lane));
-        return ucp_wireup_ep_connect(proxy, 0, rsc_index, path_index, 0, NULL);
+        return ucp_wireup_ep_connect(proxy, 0, rsc_index, path_index, 0, NULL,
+                                    NULL);
     }
 
     status = ucp_wireup_iface_ep_create(ucp_worker_iface(ep->worker, rsc_index),
