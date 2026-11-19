@@ -549,7 +549,13 @@ ucp_wireup_ep_peer_address(ucp_worker_h worker, ucp_rsc_index_t rsc_index,
         address = &remote_address->address_list[i];
         if ((address->md_index == context->tl_rscs[rsc_index].md_index) &&
             (address->tl_name_csum ==
-             context->tl_rscs[rsc_index].tl_name_csum)) {
+             context->tl_rscs[rsc_index].tl_name_csum) &&
+            /* A peer reports one entry per interface of that transport, so the
+             * transport alone does not identify the one this lane talks to: a
+             * lane on one device must be paired with the peer entry of the
+             * same device, or the address handed to the transport names
+             * another port and the lane never comes up. */
+            (address->dev_index == context->tl_rscs[rsc_index].dev_index)) {
             return address;
         }
     }
