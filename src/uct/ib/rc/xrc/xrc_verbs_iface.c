@@ -746,6 +746,15 @@ uct_xrc_verbs_node_qp_create(uct_xrc_verbs_iface_t *iface,
     }
 
     size        = ucs_roundup_pow2(ucs_max(cap.max_send_wr, 2u));
+    ucs_info("%s: iface %p initiator QP 0x%x asked for %u send entries, "
+             "device allows %u, granted %u, one endpoint takes %u, so it serves "
+             "up to %u endpoints",
+             uct_ib_device_name(uct_ib_iface_device(&iface->super.super)),
+             iface, nqp->qpn, max_wr,
+             uct_ib_iface_device(&iface->super.super)->dev_attr.orig_attr
+             .max_qp_wr, cap.max_send_wr, iface->config.tx_max_wr,
+             cap.max_send_wr / ucs_max(iface->config.tx_max_wr, 1u));
+
     nqp->max_eps     = ucs_max(cap.max_send_wr / iface->config.tx_max_wr, 1u);
     /* The depth actually granted, not the one asked for: the two differ when
      * the request had to be lowered, and the number of endpoints this queue
