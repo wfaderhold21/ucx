@@ -891,16 +891,22 @@ void uct_xrc_verbs_node_qp_release(uct_xrc_verbs_node_qp_t *nqp)
         return;
     }
 
-    if (nqp->shared && (nqp->txcnt.pi == nqp->txcnt.ci)) {
-        /* Keep it. This queue belongs to the node rather than to the endpoint
-         * which happened to be the last one using it, and it is already
-         * connected, so the next endpoint to that node takes it as it is
-         * instead of paying for a queue and a connection round trip again.
-         * Keeping the idle ones is also what makes the number of queues equal
-         * the number of nodes reached: destroying them at zero users meant
-         * that a run which retires and recreates lanes held more queues at
-         * peak than it had peers, even though it knew only one queue per node.
-         * The interface teardown still takes them all down. */
+    if (nqp->shared &&
+        ((uint16_t)(nqp->txcnt.pi - nqp->txcnt.ci) <=
+         (nqp->max_send_wr / 2))) {
+        /* Keep it, work outstanding or not. The work which a destroyed
+         * endpoint left behind is no longer a reason to poison the queue: its
+         * slots name no endpoint, so its completions are popped and skipped,
+         * and putting the queue into the error state only threw away a queue
+         * the node still needs and forced a replacement to be created for the
+         * same peer.
+         *
+         * The bound is what keeps that safe. Work which never completes would
+         * let the distance between the posted and the taken counter grow, and
+         * the ring of endpoints which follows it cannot wrap: once the gap
+         * passes half the send queue, the queue is retired and drained as
+         * before, so a peer which stopped answering still costs one queue
+         * rather than an assertion. */
         return;
     }
 
@@ -910,6 +916,12 @@ void uct_xrc_verbs_node_qp_release(uct_xrc_verbs_node_qp_t *nqp)
      * last of their completions is taken from the completion queue, because
      * the completions of a destroyed QP would name endpoints which are gone
      * with it. */
+    ucs_info("%s: iface %p retire initiator QP 0x%x: shared %d users %u "
+             "outstanding %u granted %u half %u",
+             uct_ib_device_name(uct_ib_iface_device(&nqp->iface->super.super)),
+             nqp->iface, nqp->qpn, nqp->shared, nqp->refcount,
+             (uint16_t)(nqp->txcnt.pi - nqp->txcnt.ci), nqp->max_send_wr,
+             nqp->max_send_wr / 2);
     nqp->retired = 1;
     (void)uct_ib_modify_qp(nqp->qp, IBV_QPS_ERR);
     if (nqp->txcnt.pi == nqp->txcnt.ci) {
