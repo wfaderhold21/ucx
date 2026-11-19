@@ -226,6 +226,7 @@ out:
 static UCS_F_ALWAYS_INLINE unsigned
 uct_xrc_verbs_iface_poll_tx(uct_xrc_verbs_iface_t *iface)
 {
+    uct_rc_iface_t *rc_iface = &iface->super;
     uct_xrc_verbs_node_qp_t *nqp;
     uint16_t count;
     int i;
@@ -233,8 +234,23 @@ uct_xrc_verbs_iface_poll_tx(uct_xrc_verbs_iface_t *iface)
     struct ibv_wc wc[num_wcs];
     ucs_status_t status;
 
+    if (ucs_unlikely((rc_iface->tx.cq_available <= 0) &&
+                     !iface->credits_reported)) {
+        iface->credits_reported = 1;
+        ucs_info("%s: iface %p out of send completion credits: %u completions "
+                 "of unknown queues, %u failed",
+                 uct_ib_device_name(uct_ib_iface_device(&iface->super.super)),
+                 iface, iface->poll_unknown, iface->poll_fail);
+    }
+
     UCT_XRC_VERBS_IFACE_FOREACH_TXWQE(&iface->super, i, wc, num_wcs) {
         nqp = uct_xrc_verbs_node_qp_lookup(iface, wc[i].qp_num);
+        if (ucs_unlikely(nqp == NULL)) {
+            ++iface->poll_unknown;
+        } else if (ucs_unlikely(wc[i].status != IBV_WC_SUCCESS)) {
+            ++iface->poll_fail;
+        }
+
         if (ucs_unlikely((wc[i].status != IBV_WC_SUCCESS) || (nqp == NULL))) {
             status = uct_ib_wc_to_ucs_status(wc[i].status);
             iface->super.super.ops->handle_failure(&iface->super.super, &wc[i],
@@ -988,6 +1004,9 @@ static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
     self->nqp_shared_refs     = 0;
     self->nqp_last_send_wr    = 0;
     self->nqp_key_miss        = 0;
+    self->poll_unknown        = 0;
+    self->poll_fail           = 0;
+    self->credits_reported    = 0;
     self->nqp_gate_full       = 0;
     self->ep_shared           = 0;
     self->ep_priv_cfg         = 0;

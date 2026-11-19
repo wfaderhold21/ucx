@@ -221,6 +221,9 @@ typedef struct uct_xrc_verbs_iface {
     unsigned                    nqp_shared_created; /* shared QPs ever created */
     unsigned                    nqp_shared_refs;    /* peak users of one of them */
     unsigned                    nqp_last_send_wr;   /* depth of the last one     */
+    unsigned                    poll_unknown;       /* completions of no queue   */
+    unsigned                    poll_fail;          /* failed completions        */
+    int                         credits_reported;   /* the report was made       */
     unsigned                    nqp_key_miss;       /* lookups with no such node */
     unsigned                    nqp_gate_full;      /* found the node, queue full*/
     unsigned                    ep_shared;    /* eps given a shared initiator  */
