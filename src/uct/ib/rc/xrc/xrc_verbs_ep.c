@@ -1020,15 +1020,32 @@ UCS_CLASS_CLEANUP_FUNC(uct_xrc_verbs_ep_t)
     }
 
     if (self->txcnt.pi != self->txcnt.ci) {
-        /* Its operations are still in flight on a QP which outlives this
-         * endpoint, and their completions would name an endpoint which is
-         * gone. Discard the operations of the QP and ignore whatever of them
-         * is still reported afterwards. */
-        ucs_trace("ep %p: %u operations of initiator QP 0x%x did not complete",
-                  self, (uint16_t)(self->txcnt.pi - self->txcnt.ci),
-                  self->nqp->qpn);
-        uct_ib_modify_qp(self->nqp->qp, IBV_QPS_ERR);
-        self->nqp->stale_eps = 1;
+        if (!self->nqp->shared) {
+            /* The QP goes with this endpoint, so it can be errored and its
+             * remaining completions discarded. */
+            ucs_trace("ep %p: %u operations of initiator QP 0x%x did not "
+                      "complete", self,
+                      (uint16_t)(self->txcnt.pi - self->txcnt.ci),
+                      self->nqp->qpn);
+            uct_ib_modify_qp(self->nqp->qp, IBV_QPS_ERR);
+            self->nqp->stale_eps = 1;
+        } else {
+            /* The QP outlives this endpoint and other endpoints post to it, so
+             * it must be left alone: erroring it would stop every one of them,
+             * silently.  The send queue is in order and this endpoint owns
+             * exactly the slots between its own counters, so detach those and
+             * only those; their completions are still popped, they simply name
+             * no endpoint any more. */
+            uint16_t p;
+
+            ucs_trace("ep %p: %u operations of shared initiator QP 0x%x did "
+                      "not complete", self,
+                      (uint16_t)(self->txcnt.pi - self->txcnt.ci),
+                      self->nqp->qpn);
+            for (p = self->txcnt.ci; p != self->txcnt.pi; ++p) {
+                self->nqp->eps[p & self->nqp->eps_mask] = NULL;
+            }
+        }
     }
 
     uct_xrc_verbs_node_qp_release(self->nqp);

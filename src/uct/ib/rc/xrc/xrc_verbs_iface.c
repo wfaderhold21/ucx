@@ -132,8 +132,14 @@ uct_xrc_verbs_update_tx_res(uct_xrc_verbs_iface_t *iface,
     }
 
     for (i = 0; i < count; ++i) {
-        ep = nqp->eps[nqp->txcnt.ci & nqp->eps_mask];
+        ep = nqp->eps[nqp->eps_mask & nqp->txcnt.ci];
         ++nqp->txcnt.ci;
+        if (ucs_unlikely(ep == NULL)) {
+            /* Posted by an endpoint which was destroyed before this completed:
+             * the queue has to advance, there is simply nobody to tell. */
+            continue;
+        }
+
         ++ep->txcnt.ci;
         uct_rc_txqp_completion_desc(&ep->super.txqp, ep->txcnt.ci);
         uct_rc_txqp_available_add(&ep->super.txqp, 1);
