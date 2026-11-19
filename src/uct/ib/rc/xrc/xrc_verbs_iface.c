@@ -891,11 +891,25 @@ void uct_xrc_verbs_node_qp_release(uct_xrc_verbs_node_qp_t *nqp)
         return;
     }
 
-    /* No endpoint sends through it any more. Move it to error state, so that
-     * the operations which are still in flight complete, and destroy it when
-     * the last of their completions is taken from the completion queue,
-     * because the completions of a destroyed QP would name endpoints which are
-     * gone with it. */
+    if (nqp->shared && (nqp->txcnt.pi == nqp->txcnt.ci)) {
+        /* Keep it. This queue belongs to the node rather than to the endpoint
+         * which happened to be the last one using it, and it is already
+         * connected, so the next endpoint to that node takes it as it is
+         * instead of paying for a queue and a connection round trip again.
+         * Keeping the idle ones is also what makes the number of queues equal
+         * the number of nodes reached: destroying them at zero users meant
+         * that a run which retires and recreates lanes held more queues at
+         * peak than it had peers, even though it knew only one queue per node.
+         * The interface teardown still takes them all down. */
+        return;
+    }
+
+    /* Nothing is sending through it and work is still outstanding, or it is a
+     * queue of one endpoint alone. Move it to error state, so that the
+     * operations which are still in flight complete, and destroy it when the
+     * last of their completions is taken from the completion queue, because
+     * the completions of a destroyed QP would name endpoints which are gone
+     * with it. */
     nqp->retired = 1;
     (void)uct_ib_modify_qp(nqp->qp, IBV_QPS_ERR);
     if (nqp->txcnt.pi == nqp->txcnt.ci) {
