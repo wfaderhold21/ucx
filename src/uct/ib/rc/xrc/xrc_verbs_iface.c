@@ -866,8 +866,13 @@ uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
         ++iface->nqp_shared_created;
         iface->nqp_last_send_wr = nqp->max_send_wr;
         nqp->key    = *key;
-        ucs_debug("iface %p share initiator QP 0x%x with all endpoints to the "
-                  "same remote node", iface, nqp->qpn);
+        ucs_info("%s: iface %p initiator QP 0x%x serves lid 0x%x gid %u.%u."
+                 "%u.%u.%u.%u.%u.%u",
+                 uct_ib_device_name(uct_ib_iface_device(&iface->super.super)),
+                 iface, nqp->qpn, key->lid,
+                 key->gid.raw[8], key->gid.raw[9], key->gid.raw[10],
+                 key->gid.raw[11], key->gid.raw[12], key->gid.raw[13],
+                 key->gid.raw[14], key->gid.raw[15]);
     }
 
     ++nqp->refcount;

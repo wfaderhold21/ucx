@@ -918,7 +918,12 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
                             params->path_index : 0, &ah_attr, &path_mtu);
             if (status == UCS_OK) {
                 key.gid = ah_attr.grh.dgid;
-                key.lid = ah_attr.dlid;
+                /* A global address is routed by its GID: on RoCE the LID
+                 * plays no part in reaching the peer, and the same node is
+                 * reached under several of them, which would give the node a
+                 * queue per path instead of one. Keep the LID only where it
+                 * is what identifies the destination. */
+                key.lid = ah_attr.is_global ? 0 : ah_attr.dlid;
                 key_p   = &key;
                 ++iface->ep_shared;
             } else {
