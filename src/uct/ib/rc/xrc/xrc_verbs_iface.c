@@ -837,6 +837,15 @@ uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
                  iface->config.tx_max_wr <= nqp->max_send_wr) &&
                 !memcmp(&nqp->key, key, sizeof(*key))) {
                 ++nqp->refcount;
+                /* The peaks have to be recorded here too. Only the creation
+                 * path used to do it, and a queue is created for its first
+                 * endpoint alone, so the census reported one endpoint per
+                 * shared queue however many actually used it. */
+                nqp->max_refs = ucs_max(nqp->max_refs, nqp->refcount);
+                iface->nqp_shared_refs = ucs_max(iface->nqp_shared_refs,
+                                                 nqp->refcount);
+                iface->eps_shared_peak = ucs_max(iface->eps_shared_peak,
+                                                 nqp->refcount);
                 *nqp_p = nqp;
                 return UCS_OK;
             }
