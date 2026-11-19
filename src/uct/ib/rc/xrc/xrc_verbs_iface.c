@@ -693,7 +693,7 @@ uct_xrc_verbs_node_qp_create(uct_xrc_verbs_iface_t *iface,
     ucs_status_t status;
     unsigned size, max_wr;
 
-    nqp = ucs_malloc(sizeof(*nqp), "xrc node qp");
+    nqp = ucs_calloc(1, sizeof(*nqp), "xrc node qp");
     if (nqp == NULL) {
         return UCS_ERR_NO_MEMORY;
     }
@@ -721,7 +721,12 @@ uct_xrc_verbs_node_qp_create(uct_xrc_verbs_iface_t *iface,
     }
 
     size        = ucs_roundup_pow2(ucs_max(cap.max_send_wr, 2u));
-    nqp->max_eps = ucs_max(cap.max_send_wr / iface->config.tx_max_wr, 1u);
+    nqp->max_eps     = ucs_max(cap.max_send_wr / iface->config.tx_max_wr, 1u);
+    /* The depth actually granted, not the one asked for: the two differ when
+     * the request had to be lowered, and the number of endpoints this queue
+     * can serve is derived from the granted one. */
+    nqp->max_send_wr = cap.max_send_wr;
+    nqp->max_refs    = 0;
     nqp->eps = ucs_malloc(sizeof(*nqp->eps) * size, "xrc node qp eps");
     if (nqp->eps == NULL) {
         status = UCS_ERR_NO_MEMORY;
@@ -783,6 +788,14 @@ uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
 
     if (key != NULL) {
         ucs_list_for_each(nqp, &iface->node_qps, list) {
+            if (!memcmp(&nqp->key, key, sizeof(*key))) {
+                /* The same node was seen before; if its queue cannot take
+                 * another endpoint now, that is a different answer from never
+                 * having seen the node at all. */
+                if (!nqp->retired) {
+                    ++iface->nqp_gate_full;
+                }
+            }
             if (nqp->shared && !nqp->retired &&
                 /* What the queue has to have room for is the work of one more
                  * endpoint, not a headcount of them: a queue granted only
@@ -799,6 +812,10 @@ uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
                 return UCS_OK;
             }
         }
+    }
+
+    if (key != NULL) {
+        ++iface->nqp_key_miss;
     }
 
     status = uct_xrc_verbs_node_qp_create(iface, &nqp);
@@ -873,12 +890,14 @@ static void uct_xrc_verbs_iface_log_qp_usage(uct_xrc_verbs_iface_t *iface)
              (unsigned)iface->super.super.addr_size);
     ucs_info("%s: iface %p QP model: %u target QPs, %u shared initiator QPs "
              "alive / %u created (peak endpoints served by one: %u, live peak "
-             "sum %u, send queue granted %u), ep decisions: "
+             "sum %u, send queue granted %u, lookups unmatched %u refused %u), "
+             "ep decisions: "
              "%u shared, %u declined by config, %u peer address null, %u "
              "address not unpackable, %u field not passed",
              uct_ib_device_name(uct_ib_iface_device(&self->super.super)), self,
              self->num_tgt_qps, shared, self->nqp_shared_created,
              self->nqp_shared_refs, total, self->nqp_last_send_wr,
+             self->nqp_key_miss, self->nqp_gate_full,
              self->ep_shared, self->ep_priv_cfg, self->ep_priv_addr,
              self->ep_priv_unpack, self->ep_priv_mask);
 }
@@ -962,6 +981,8 @@ static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
     self->nqp_shared_created  = 0;
     self->nqp_shared_refs     = 0;
     self->nqp_last_send_wr    = 0;
+    self->nqp_key_miss        = 0;
+    self->nqp_gate_full       = 0;
     self->ep_shared           = 0;
     self->ep_priv_cfg         = 0;
     self->ep_priv_addr        = 0;
