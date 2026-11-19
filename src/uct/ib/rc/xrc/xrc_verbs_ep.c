@@ -26,7 +26,7 @@ static UCS_F_ALWAYS_INLINE void
 uct_xrc_verbs_ep_fence_put(uct_xrc_verbs_iface_t *iface, uct_xrc_verbs_ep_t *ep,
                            uct_rkey_t *rkey, uint64_t *addr)
 {
-    uct_rc_ep_fence_put(&iface->super, &ep->fi, rkey, addr,
+    uct_rc_ep_fence_put(&iface->super, &ep->nqp->fi, rkey, addr,
                         ep->super.atomic_mr_offset);
 }
 
@@ -39,7 +39,7 @@ uct_xrc_verbs_ep_post_send(uct_xrc_verbs_iface_t *iface, uct_xrc_verbs_ep_t *ep,
     int ret;
 
     ucs_assertv(ep->ini_qp->state == IBV_QPS_RTS, "QP 0x%x state is %d",
-                ep->ini_qp->qp_num, ep->ini_qp->state);
+                ep->nqp->qpn, ep->ini_qp->state);
 
     if (!(send_flags & IBV_SEND_SIGNALED)) {
         send_flags |= uct_rc_iface_tx_moderation(&iface->super, &ep->super.txqp,
@@ -47,13 +47,16 @@ uct_xrc_verbs_ep_post_send(uct_xrc_verbs_iface_t *iface, uct_xrc_verbs_ep_t *ep,
     }
 
     if (wr->opcode == IBV_WR_SEND) {
-        uct_rc_ep_fm(&iface->super, &ep->fi, 0);
+        uct_rc_ep_fm(&iface->super, &ep->nqp->fi, 0);
     } else if (wr->opcode == IBV_WR_RDMA_READ) {
-        send_flags |= uct_rc_ep_fm(&iface->super, &ep->fi, IBV_SEND_FENCE);
+        send_flags |= uct_rc_ep_fm(&iface->super, &ep->nqp->fi,
+                                  IBV_SEND_FENCE);
     }
 
     wr->send_flags              = send_flags;
-    wr->wr_id                   = ep->txcnt.pi + 1;
+    /* The completion is attributed to the endpoint by the position which its
+     * operation has in the send queue of the QP, shared between endpoints. */
+    wr->wr_id                   = ep->nqp->txcnt.pi + 1;
     /* XRC steering: every work request names the destination SRQ. */
     wr->qp_type.xrc.remote_srqn = ep->remote_srqn;
 
@@ -66,8 +69,8 @@ uct_xrc_verbs_ep_post_send(uct_xrc_verbs_iface_t *iface, uct_xrc_verbs_ep_t *ep,
         ucs_fatal("ibv_post_send() returned %d (%m)", ret);
     }
 
-    uct_xrc_verbs_txqp_posted(&ep->super.txqp, &ep->txcnt, &iface->super,
-                              send_flags & IBV_SEND_SIGNALED);
+    uct_xrc_verbs_node_qp_posted(ep->nqp, ep, &iface->super,
+                                 send_flags & IBV_SEND_SIGNALED);
 }
 
 static UCS_F_ALWAYS_INLINE void
@@ -154,7 +157,8 @@ uct_xrc_verbs_ep_atomic(uct_xrc_verbs_ep_t *ep, int opcode, void *result,
     uct_xrc_verbs_ep_atomic_post(ep, opcode, compare_add, swap, remote_addr,
                                  rkey, desc,
                                  IBV_SEND_SIGNALED |
-                                 uct_rc_ep_fm(&iface->super, &ep->fi,
+                                 uct_rc_ep_fm(&iface->super,
+                                              &ep->nqp->fi,
                                               IBV_SEND_FENCE));
     return UCS_INPROGRESS;
 }
@@ -527,7 +531,11 @@ ucs_status_t uct_xrc_verbs_ep_flush(uct_ep_h tl_ep, unsigned flags,
         uct_xrc_verbs_ep_post_flush(ep, IBV_SEND_SIGNALED);
     }
 
-    if (ucs_unlikely((flags & UCT_FLUSH_FLAG_CANCEL) && !already_canceled)) {
+    if (ucs_unlikely((flags & UCT_FLUSH_FLAG_CANCEL) && !already_canceled) &&
+        !ep->nqp->shared) {
+        /* Cancelling means moving the QP to error state, which would discard
+         * the operations of the other endpoints of a shared initiator QP too,
+         * so only a private one may be cancelled this way. */
         status = uct_ib_modify_qp(ep->ini_qp, IBV_QPS_ERR);
         if (status != UCS_OK) {
             return status;
@@ -542,7 +550,7 @@ ucs_status_t uct_xrc_verbs_ep_fence(uct_ep_h tl_ep, unsigned flags)
 {
     uct_xrc_verbs_ep_t *ep = ucs_derived_of(tl_ep, uct_xrc_verbs_ep_t);
 
-    return uct_rc_ep_fence(tl_ep, &ep->fi);
+    return uct_rc_ep_fence(tl_ep, &ep->nqp->fi);
 }
 
 ucs_status_t uct_xrc_verbs_ep_post_check(uct_ep_h tl_ep, uct_completion_t *comp)
@@ -569,7 +577,7 @@ void uct_xrc_verbs_ep_vfs_populate(uct_rc_ep_t *rc_ep)
 
     ucs_vfs_obj_add_dir(rc_iface, ep, "ep/%p", ep);
     ucs_vfs_obj_add_ro_file(ep, ucs_vfs_show_primitive,
-                            &ep->ini_qp->qp_num, UCS_VFS_TYPE_U32_HEX,
+                            &ep->nqp->qpn, UCS_VFS_TYPE_U32_HEX,
                             "ini_qp_num");
     ucs_vfs_obj_add_ro_file(ep, ucs_vfs_show_primitive,
                             &ep->tgt_qp->qp_num, UCS_VFS_TYPE_U32_HEX,
@@ -782,7 +790,18 @@ uct_xrc_verbs_ep_connect_to_ep_v2(uct_ep_h tl_ep,
     ini_qp_num = uct_ib_unpack_uint24(xrc_addr->super.ini_qp_num);
 
     if (!(ep->conn_flags & UCT_XRC_VERBS_EP_FLAG_INI_CONNECTED)) {
-        /* Outbound operations: connect the initiator to the remote target. */
+        /* Outbound operations: connect the initiator to the remote target. The
+         * initiator is shared between the endpoints to one node, and which of
+         * their targets it is connected to does not matter, because a request
+         * names the destination shared receive queue itself: the first
+         * endpoint to connect brings the QP up for all of them. */
+        if (ep->nqp->connected) {
+            ep->remote_srqn = ntohl(xrc_addr->super.srqn);
+            ep->conn_flags |= UCT_XRC_VERBS_EP_FLAG_INI_CONNECTED;
+            return uct_xrc_verbs_ep_tgt_connect(iface, ep, ini_qp_num,
+                                               &ah_attr, path_mtu);
+        }
+
         status = uct_rc_iface_qp_connect(&iface->super, ep->ini_qp, tgt_qp_num,
                                         &ah_attr, path_mtu);
         if (status != UCS_OK) {
@@ -791,6 +810,7 @@ uct_xrc_verbs_ep_connect_to_ep_v2(uct_ep_h tl_ep,
 
         ep->remote_srqn = ntohl(xrc_addr->super.srqn);
         ep->conn_flags |= UCT_XRC_VERBS_EP_FLAG_INI_CONNECTED;
+        ep->nqp->connected = 1;
     }
 
     if (!(ep->conn_flags & UCT_XRC_VERBS_EP_FLAG_TGT_CONNECTED)) {
@@ -851,27 +871,58 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
 {
     uct_xrc_verbs_iface_t *iface = ucs_derived_of(params->iface,
                                                   uct_xrc_verbs_iface_t);
-    uct_ib_md_t *md              = uct_ib_iface_md(&iface->super.super);
+    uct_xrc_verbs_node_key_t key, *key_p = NULL;
+    struct ibv_ah_attr ah_attr;
+    enum ibv_mtu path_mtu;
     ucs_status_t status;
 
-    status = uct_xrc_verbs_iface_create_ini_qp(iface, &self->ini_qp, NULL);
+    /* All the endpoints of this process which talk to one remote node share
+     * the initiator QP of that node: an XRC work request names the destination
+     * shared receive queue itself, so the QP only fixes the node. The address
+     * of the peer names it, and it is known here because UCP passes it. With
+     * SHARED_INI=n no key is given, and the endpoint gets a QP of its own. */
+    if (iface->config.shared_ini &&
+        (params->field_mask & UCT_EP_PARAM_FIELD_DEV_ADDR) &&
+        (params->dev_addr != NULL)) {
+        status = uct_ib_iface_fill_ah_attr_from_addr(
+                &iface->super.super, params->dev_addr,
+                (params->field_mask & UCT_EP_PARAM_FIELD_PATH_INDEX) ?
+                        params->path_index : 0, &ah_attr, &path_mtu);
+        if (status == UCS_OK) {
+            key.gid = ah_attr.grh.dgid;
+            key.lid = ah_attr.dlid;
+            key_p   = &key;
+        } else {
+            ucs_trace("ep %p: cannot unpack the address of the peer, use an "
+                      "initiator QP of its own", self);
+            status = UCS_OK;
+        }
+    }
+
+    status = uct_xrc_verbs_iface_get_node_qp(iface, key_p, &self->nqp);
     if (status != UCS_OK) {
         goto err;
     }
 
+    self->ini_qp = self->nqp->qp;
+
     status = uct_xrc_verbs_iface_create_tgt_qp(iface, &self->tgt_qp);
     if (status != UCS_OK) {
-        goto err_destroy_ini;
+        goto err_release_nqp;
     }
 
     UCS_CLASS_CALL_SUPER_INIT(uct_rc_ep_t, &iface->super,
-                              self->ini_qp->qp_num, params);
+                              self->nqp->qpn, params);
 
     /* An XRC initiator only originates operations, it is never a target, so it
      * needs no remote access permissions. The target QP does. */
-    status = uct_xrc_verbs_qp_to_init(self->ini_qp, iface, 0);
-    if (status != UCS_OK) {
-        goto err_destroy_tgt;
+    if (!self->nqp->inited) {
+        status = uct_xrc_verbs_qp_to_init(self->ini_qp, iface, 0);
+        if (status != UCS_OK) {
+            goto err_destroy_tgt;
+        }
+
+        self->nqp->inited = 1;
     }
 
     status = uct_xrc_verbs_qp_to_init(self->tgt_qp, iface,
@@ -882,25 +933,14 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
         goto err_destroy_tgt;
     }
 
-    status = uct_ib_device_async_event_register(&md->dev,
-                                                IBV_EVENT_QP_LAST_WQE_REACHED,
-                                                self->ini_qp->qp_num);
-    if (status != UCS_OK) {
-        goto err_destroy_tgt;
-    }
-
-    status = uct_rc_iface_add_qp(&iface->super, &self->super,
-                                 self->ini_qp->qp_num);
-    if (status != UCS_OK) {
-        goto err_event_unreg;
-    }
-
     /* Receive completions name the target QP, so it has to resolve to this
-     * endpoint as well (for flow control in particular). */
+     * endpoint (for flow control in particular). The initiator QP is not
+     * registered: it is shared, and its completions are attributed to the
+     * endpoint by the position which its operation has in its send queue. */
     status = uct_rc_iface_add_qp(&iface->super, &self->super,
                                  self->tgt_qp->qp_num);
     if (status != UCS_OK) {
-        goto err_remove_ini_qp;
+        goto err_destroy_tgt;
     }
 
     uct_rc_txqp_available_set(&self->super.txqp, iface->config.tx_max_wr);
@@ -909,21 +949,15 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
     self->remote_srqn = 0;
     self->conn_flags  = 0;
 
-    ucs_debug("created xrc ep %p ini_qp 0x%x tgt_qp 0x%x", self,
-              self->ini_qp->qp_num, self->tgt_qp->qp_num);
+    ucs_debug("created xrc ep %p ini_qp 0x%x tgt_qp 0x%x shared %d", self,
+              self->nqp->qpn, self->tgt_qp->qp_num, key_p != NULL);
 
     return UCS_OK;
 
-err_remove_ini_qp:
-    uct_rc_iface_remove_qp(&iface->super, self->ini_qp->qp_num);
-err_event_unreg:
-    uct_ib_device_async_event_unregister(&md->dev,
-                                         IBV_EVENT_QP_LAST_WQE_REACHED,
-                                         self->ini_qp->qp_num);
 err_destroy_tgt:
     uct_ib_destroy_qp(self->tgt_qp);
-err_destroy_ini:
-    uct_ib_destroy_qp(self->ini_qp);
+err_release_nqp:
+    uct_xrc_verbs_node_qp_release(self->nqp);
 err:
     return status;
 }
@@ -932,11 +966,10 @@ UCS_CLASS_CLEANUP_FUNC(uct_xrc_verbs_ep_t)
 {
     uct_xrc_verbs_iface_t *iface = ucs_derived_of(self->super.super.super.iface,
                                                   uct_xrc_verbs_iface_t);
-    uct_xrc_verbs_iface_qp_cleanup_ctx_t *cleanup_ctx;
+    unsigned i;
 
     uct_rc_txqp_purge_outstanding(&iface->super, &self->super.txqp,
                                   UCS_ERR_CANCELED, self->txcnt.pi, 1);
-    uct_ib_modify_qp(self->ini_qp, IBV_QPS_ERR);
     uct_ib_modify_qp(self->tgt_qp, IBV_QPS_ERR);
 
     /* The target QP has no send queue and its receive queue is the interface
@@ -945,13 +978,28 @@ UCS_CLASS_CLEANUP_FUNC(uct_xrc_verbs_ep_t)
     uct_rc_iface_remove_qp(&iface->super, self->tgt_qp->qp_num);
     uct_ib_destroy_qp(self->tgt_qp);
 
-    cleanup_ctx = ucs_malloc(sizeof(*cleanup_ctx), "xrc_qp_cleanup_ctx");
-    ucs_assert_always(cleanup_ctx != NULL);
-    cleanup_ctx->qp = self->ini_qp;
+    /* The send queue of the shared initiator QP still refers to this endpoint
+     * by the operations it has in flight, so take their completions off the
+     * completion queue before it is gone. If they do not arrive, the endpoint
+     * is kept by the deferred cleanup below until they do. */
     ucs_assert(UCS_CIRCULAR_COMPARE16(self->txcnt.pi, >=, self->txcnt.ci));
-    uct_rc_ep_cleanup_qp(&self->super, &cleanup_ctx->super,
-                         self->ini_qp->qp_num,
-                         self->txcnt.pi - self->txcnt.ci);
+    for (i = 0; (self->txcnt.pi != self->txcnt.ci) && (i < 1000); ++i) {
+        uct_xrc_verbs_iface_poll_tx_wqes(iface);
+    }
+
+    if (self->txcnt.pi != self->txcnt.ci) {
+        /* Its operations are still in flight on a QP which outlives this
+         * endpoint, and their completions would name an endpoint which is
+         * gone. Discard the operations of the QP and ignore whatever of them
+         * is still reported afterwards. */
+        ucs_trace("ep %p: %u operations of initiator QP 0x%x did not complete",
+                  self, (uint16_t)(self->txcnt.pi - self->txcnt.ci),
+                  self->nqp->qpn);
+        uct_ib_modify_qp(self->nqp->qp, IBV_QPS_ERR);
+        self->nqp->stale_eps = 1;
+    }
+
+    uct_xrc_verbs_node_qp_release(self->nqp);
 }
 
 UCS_CLASS_DEFINE(uct_xrc_verbs_ep_t, uct_rc_ep_t);

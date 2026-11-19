@@ -32,6 +32,24 @@ uct_xrc_verbs_txqp_posted(uct_rc_txqp_t *txqp, uct_xrc_verbs_txcnt_t *txcnt,
     uct_rc_txqp_posted(txqp, iface, 1, signaled);
 }
 
+/* Record the endpoint in the send queue of the initiator QP it posted to, so
+ * that the completion of that operation can be attributed to it again, and
+ * update the counters of both. */
+static inline void
+uct_xrc_verbs_node_qp_posted(uct_xrc_verbs_node_qp_t *nqp,
+                             uct_xrc_verbs_ep_t *ep, uct_rc_iface_t *iface,
+                             int signaled)
+{
+    ucs_assertv((uint16_t)(nqp->txcnt.pi - nqp->txcnt.ci) < nqp->eps_mask,
+                "qpn 0x%x pi %d ci %d", nqp->qpn, nqp->txcnt.pi,
+                nqp->txcnt.ci);
+
+    nqp->eps[nqp->txcnt.pi & nqp->eps_mask] = ep;
+    ++nqp->txcnt.pi;
+
+    uct_xrc_verbs_txqp_posted(&ep->super.txqp, &ep->txcnt, iface, signaled);
+}
+
 
 /* XRC sends carry the destination SRQ number in the work request. */
 #if defined(IBV_QPT_XRC_SEND) && defined(IBV_QP_INIT_ATTR_XRCD)

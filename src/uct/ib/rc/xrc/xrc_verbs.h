@@ -20,6 +20,11 @@
 #define UCT_XRC_VERBS_MAX_EPS_DEFAULT  8192
 
 
+typedef struct uct_xrc_verbs_iface        uct_xrc_verbs_iface_t;
+typedef struct uct_xrc_verbs_node_qp      uct_xrc_verbs_node_qp_t;
+typedef struct uct_xrc_verbs_ep           uct_xrc_verbs_ep_t;
+
+
 /**
  * Endpoint address flags.
  */
@@ -95,16 +100,66 @@ typedef struct uct_xrc_verbs_txcnt {
 
 
 /**
+ * Identity of a remote node as seen from an endpoint: the NIC port of the peer
+ * which the address of the peer interface points at. Every process of that
+ * node is reached through that port, so this is what a shared initiator QP is
+ * keyed by.
+ */
+typedef struct {
+    union ibv_gid gid;   /* destination GID, when the address is global */
+    uint32_t      lid;   /* destination LID, when it is not             */
+} UCS_S_PACKED uct_xrc_verbs_node_key_t;
+
+
+/**
+ * Shared XRC initiator QP.
+ *
+ * One initiator QP serves every endpoint which sends to the same remote node,
+ * because an XRC work request names the destination shared receive queue
+ * itself (wr.qp_type.xrc.remote_srqn): the destination node is fixed by the
+ * QP, the destination process by the work request. The key is the device
+ * address of the peer, so all endpoints of a process which talk to one node
+ * share a single QP, which is the QP-count saving XRC exists for. With
+ * SHARED_INI=n the key is made unique per endpoint, which reproduces the
+ * one-initiator-QP-per-endpoint behaviour.
+ *
+ * A send completion names the QP, not the endpoint, so the endpoints are
+ * recorded in post order and completed in that order, which the in-order send
+ * queue of a reliable connection guarantees.
+ */
+typedef struct uct_xrc_verbs_node_qp {
+    uct_xrc_verbs_iface_t            *iface;
+    ucs_list_link_t                   list;     /* entry in iface->node_qps    */
+    struct ibv_qp                    *qp;
+    uint32_t                          qpn;      /* qp->qp_num, cached          */
+    uct_xrc_verbs_node_key_t          key;      /* peer NIC port of the node   */
+    int                               shared;   /* looked up by key            */
+    unsigned                          refcount;
+    int                               connected; /* initiator reached RTS       */
+    int                               inited;    /* initiator reached INIT      */
+    int                               retired;   /* no user, draining CQEs      */
+    int                               stale_eps; /* its endpoints are gone      */
+    unsigned                          max_eps;   /* endpoints it can serve      */
+    uct_xrc_verbs_txcnt_t             txcnt;     /* send queue of the QP       */
+    uct_ib_fence_info_t               fi;        /* fence state of the QP      */
+    uct_xrc_verbs_ep_t              **eps;       /* endpoints in post order    */
+    uint32_t                          eps_mask;  /* ring size - 1              */
+    uct_rc_iface_qp_cleanup_ctx_t     cleanup;   /* used while being destroyed */
+} uct_xrc_verbs_node_qp_t;
+
+
+/**
  * XRC verbs endpoint.
  */
 typedef struct uct_xrc_verbs_ep {
     uct_rc_ep_t            super;
-    uct_xrc_verbs_txcnt_t  txcnt;
+    uct_xrc_verbs_txcnt_t  txcnt;       /* operations posted on the node QP   */
     uct_ib_fence_info_t    fi;
-    struct ibv_qp         *ini_qp;      /* XRC_SEND: outbound operations     */
-    struct ibv_qp         *tgt_qp;      /* XRC_RECV: inbound operations      */
-    uint32_t               remote_srqn; /* destination SRQ number            */
-    uint8_t                conn_flags;  /* UCT_XRC_VERBS_EP_FLAG_xx          */
+    uct_xrc_verbs_node_qp_t *nqp;       /* shared initiator QP of the node    */
+    struct ibv_qp         *ini_qp;      /* = nqp->qp, outbound operations     */
+    struct ibv_qp         *tgt_qp;      /* XRC_RECV: inbound operations       */
+    uint32_t               remote_srqn; /* destination SRQ number             */
+    uint8_t                conn_flags;  /* UCT_XRC_VERBS_EP_FLAG_xx           */
 } uct_xrc_verbs_ep_t;
 
 
@@ -126,6 +181,7 @@ typedef struct uct_xrc_verbs_iface_config {
     unsigned                           tgt_fallback;
     char                               *domain_dir;
     int                                domain_shared;
+    int                                shared_ini;
 } uct_xrc_verbs_iface_config_t;
 
 
@@ -143,6 +199,8 @@ typedef struct uct_xrc_verbs_iface {
     uint32_t                    srq_num;
     int                         xrcd_fd;
     char                        xrcd_path[256];
+    ucs_list_link_t             node_qps;     /* shared initiator QPs          */
+    uct_xrc_verbs_node_qp_t    *last_tx_nqp;  /* cache for send completions    */
     struct ibv_send_wr          inl_am_wr;
     struct ibv_send_wr          inl_rwrite_wr;
     struct ibv_sge              inl_sge[UCT_IB_MAX_IOV];
@@ -156,8 +214,23 @@ typedef struct uct_xrc_verbs_iface {
         unsigned                tx_max_wr;
         uct_xrc_verbs_tgt_state_t tgt_state;
         unsigned                tgt_fallback;
+        int                     domain_shared;
+        int                     shared_ini;
     } config;
 } uct_xrc_verbs_iface_t;
+
+
+/* Look up the shared initiator QP of the node which @a dev_addr belongs to,
+ * create it if this is the first endpoint to that node, and take a reference.
+ * With SHARED_INI=n, @a key is ignored and a QP of its own is given to every
+ * endpoint. @a key must be unique per endpoint in that case. */
+ucs_status_t
+uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
+                                const uct_xrc_verbs_node_key_t *key,
+                                uct_xrc_verbs_node_qp_t **nqp_p);
+
+/* Drop a reference to a shared initiator QP, destroy it when unused. */
+void uct_xrc_verbs_node_qp_release(uct_xrc_verbs_node_qp_t *nqp);
 
 
 UCS_CLASS_DECLARE(uct_xrc_verbs_ep_t, const uct_ep_params_t *);
@@ -170,12 +243,19 @@ void uct_xrc_verbs_txcnt_init(uct_xrc_verbs_txcnt_t *txcnt);
 
 
 /* Create an XRC initiator (send side) QP on the interface's completion
- * queues. When @a cap_p is not NULL, the granted queue capabilities are
- * returned there. */
+ * queues, with a send queue of @a max_send_wr work requests (the interface
+ * default when zero). When @a cap_p is not NULL, the granted queue
+ * capabilities are returned there. */
 ucs_status_t
 uct_xrc_verbs_iface_create_ini_qp(uct_xrc_verbs_iface_t *iface,
+                                  unsigned max_send_wr,
                                   struct ibv_qp **qp_p,
                                   struct ibv_qp_cap *cap_p);
+
+/* Take the completed send work requests of the interface off its send
+ * completion queue. Used to retire an endpoint whose operations are still in
+ * flight on a shared initiator QP. */
+unsigned uct_xrc_verbs_iface_poll_tx_wqes(uct_xrc_verbs_iface_t *iface);
 
 /* Create an XRC target (receive side) QP bound to the interface SRQ. */
 ucs_status_t

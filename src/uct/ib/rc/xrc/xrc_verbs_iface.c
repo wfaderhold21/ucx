@@ -85,23 +85,63 @@ static ucs_config_field_t uct_xrc_verbs_iface_config_table[] = {
    ucs_offsetof(uct_xrc_verbs_iface_config_t, domain_shared),
    UCS_CONFIG_TYPE_BOOL},
 
+  {"SHARED_INI", "y",
+   "Share one XRC initiator QP between all endpoints which send to the same\n"
+   "remote node. An XRC work request names the destination shared receive\n"
+   "queue itself, so one initiator QP can serve every process of a node, which\n"
+   "is the QP-count saving XRC exists for. With \"n\" every endpoint gets an\n"
+   "initiator QP of its own, as in\n"
+   "the first version of this transport.\n",
+   ucs_offsetof(uct_xrc_verbs_iface_config_t, shared_ini),
+   UCS_CONFIG_TYPE_BOOL},
+
   {NULL}
 };
 
-static unsigned uct_xrc_verbs_get_tx_res_count(uct_xrc_verbs_ep_t *ep,
-                                               struct ibv_wc *wc)
+/* A send completion names the shared initiator QP and how many of its
+ * operations have completed, so the endpoints are taken from the QP in the
+ * order they posted in, which the send queue of a reliable connection
+ * preserves. */
+static uct_xrc_verbs_node_qp_t *
+uct_xrc_verbs_node_qp_lookup(uct_xrc_verbs_iface_t *iface, uint32_t qpn);
+
+static void uct_xrc_verbs_node_qp_destroy(uct_xrc_verbs_node_qp_t *nqp);
+
+static unsigned
+uct_xrc_verbs_get_tx_res_count(uct_xrc_verbs_node_qp_t *nqp,
+                              struct ibv_wc *wc)
 {
-    return wc->wr_id - ep->txcnt.ci;
+    return wc->wr_id - nqp->txcnt.ci;
 }
 
 static UCS_F_ALWAYS_INLINE void
-uct_xrc_verbs_update_tx_res(uct_rc_iface_t *iface, uct_xrc_verbs_ep_t *ep,
-                            unsigned count)
+uct_xrc_verbs_update_tx_res(uct_xrc_verbs_iface_t *iface,
+                            uct_xrc_verbs_node_qp_t *nqp, unsigned count)
 {
-    ep->txcnt.ci += count;
-    uct_rc_txqp_available_add(&ep->super.txqp, count);
-    uct_rc_iface_update_reads(iface);
-    uct_rc_iface_add_cq_credits(iface, count);
+    uct_rc_iface_t *rc_iface = &iface->super;
+    uct_xrc_verbs_ep_t *ep;
+    unsigned i;
+
+    if (ucs_unlikely(nqp->retired || nqp->stale_eps)) {
+        /* The endpoints which posted these operations are gone with it, only
+         * the counters and the credits of the interface have to be restored. */
+        nqp->txcnt.ci += count;
+        uct_rc_iface_update_reads(rc_iface);
+        uct_rc_iface_add_cq_credits(rc_iface, count);
+        return;
+    }
+
+    for (i = 0; i < count; ++i) {
+        ep = nqp->eps[nqp->txcnt.ci & nqp->eps_mask];
+        ++nqp->txcnt.ci;
+        ++ep->txcnt.ci;
+        uct_rc_txqp_completion_desc(&ep->super.txqp, ep->txcnt.ci);
+        uct_rc_txqp_available_add(&ep->super.txqp, 1);
+        uct_rc_ep_schedule_pending(&ep->super);
+    }
+
+    uct_rc_iface_update_reads(rc_iface);
+    uct_rc_iface_add_cq_credits(rc_iface, count);
 }
 
 static void uct_xrc_verbs_handle_failure(uct_ib_iface_t *ib_iface, void *arg,
@@ -109,27 +149,44 @@ static void uct_xrc_verbs_handle_failure(uct_ib_iface_t *ib_iface, void *arg,
 {
     struct ibv_wc *wc       = arg;
     uct_rc_iface_t *iface   = ucs_derived_of(ib_iface, uct_rc_iface_t);
+    uct_xrc_verbs_iface_t *iface_xrc = ucs_derived_of(ib_iface,
+                                                      uct_xrc_verbs_iface_t);
     ucs_log_level_t log_lvl = UCS_LOG_LEVEL_FATAL;
     char peer_info[128]     = {};
     unsigned dest_qpn;
+    uct_xrc_verbs_node_qp_t *nqp;
     uct_xrc_verbs_ep_t *ep;
     ucs_status_t status;
     unsigned count;
     struct ibv_ah_attr ah_attr;
 
-    ep = ucs_derived_of(uct_rc_iface_lookup_ep(iface, wc->qp_num),
-                        uct_xrc_verbs_ep_t);
-    if (!ep) {
-        return;
+    nqp = uct_xrc_verbs_node_qp_lookup(iface_xrc, wc->qp_num);
+    if (nqp != NULL) {
+        /* The operations of several endpoints are in flight on the QP. Purge
+         * the ones this completion covers, from the first one affected, which
+         * is the one the error is reported for. */
+        count = uct_xrc_verbs_get_tx_res_count(nqp, wc);
+        if (count == 0) {
+            return;
+        }
+
+        ep = nqp->eps[nqp->txcnt.ci & nqp->eps_mask];
+        uct_xrc_verbs_update_tx_res(iface_xrc, nqp, count);
+    } else {
+        ep = ucs_derived_of(uct_rc_iface_lookup_ep(iface, wc->qp_num),
+                            uct_xrc_verbs_ep_t);
+        if (!ep) {
+            return;
+        }
+
+        count = 0;
+        uct_rc_txqp_purge_outstanding(iface, &ep->super.txqp, ep_status,
+                                      ep->txcnt.ci + count, 0);
     }
 
-    count = uct_xrc_verbs_get_tx_res_count(ep, wc);
-    uct_rc_txqp_purge_outstanding(iface, &ep->super.txqp, ep_status,
-                                  ep->txcnt.ci + count, 0);
     ucs_arbiter_group_purge(&iface->tx.arbiter, &ep->super.arb_group,
                             uct_rc_ep_arbiter_purge_internal_cb, NULL);
     uct_rc_ep_schedule_pending(&ep->super);
-    uct_xrc_verbs_update_tx_res(iface, ep, count);
 
     if (ep->super.flags & (UCT_RC_EP_FLAG_ERR_HANDLER_INVOKED |
                            UCT_RC_EP_FLAG_FLUSH_CANCEL)) {
@@ -143,7 +200,8 @@ static void uct_xrc_verbs_handle_failure(uct_ib_iface_t *ib_iface, void *arg,
                                       &ep->super.super.super, ep_status);
     log_lvl = uct_base_iface_failure_log_level(&ib_iface->super, status,
                                                ep_status);
-    status  = uct_ib_query_qp_peer_info(ep->ini_qp, &ah_attr, &dest_qpn);
+    status  = uct_ib_query_qp_peer_info((nqp != NULL) ? nqp->qp : ep->ini_qp,
+                                       &ah_attr, &dest_qpn);
     if (status == UCS_OK) {
         uct_ib_log_dump_qp_peer_info(ib_iface, &ah_attr, dest_qpn, peer_info,
                                      sizeof(peer_info));
@@ -162,7 +220,7 @@ out:
 static UCS_F_ALWAYS_INLINE unsigned
 uct_xrc_verbs_iface_poll_tx(uct_xrc_verbs_iface_t *iface)
 {
-    uct_xrc_verbs_ep_t *ep;
+    uct_xrc_verbs_node_qp_t *nqp;
     uint16_t count;
     int i;
     unsigned num_wcs = iface->super.super.config.tx_max_poll;
@@ -170,28 +228,33 @@ uct_xrc_verbs_iface_poll_tx(uct_xrc_verbs_iface_t *iface)
     ucs_status_t status;
 
     UCT_XRC_VERBS_IFACE_FOREACH_TXWQE(&iface->super, i, wc, num_wcs) {
-        ep = ucs_derived_of(uct_rc_iface_lookup_ep(&iface->super, wc[i].qp_num),
-                            uct_xrc_verbs_ep_t);
-        if (ucs_unlikely((wc[i].status != IBV_WC_SUCCESS) || (ep == NULL))) {
+        nqp = uct_xrc_verbs_node_qp_lookup(iface, wc[i].qp_num);
+        if (ucs_unlikely((wc[i].status != IBV_WC_SUCCESS) || (nqp == NULL))) {
             status = uct_ib_wc_to_ucs_status(wc[i].status);
             iface->super.super.ops->handle_failure(&iface->super.super, &wc[i],
                                                    status);
             continue;
         }
 
-        count = uct_xrc_verbs_get_tx_res_count(ep, &wc[i]);
-        ucs_trace_poll("xrc_verbs iface %p tx_wc wrid 0x%lx ep %p qpn 0x%x "
-                       "count %d",
-                       iface, wc[i].wr_id, ep, wc[i].qp_num, count);
+        count = uct_xrc_verbs_get_tx_res_count(nqp, &wc[i]);
+        ucs_trace_poll("xrc_verbs iface %p tx_wc wrid 0x%lx nqp 0x%x count %d",
+                       iface, wc[i].wr_id, nqp->qpn, count);
 
-        uct_rc_txqp_completion_desc(&ep->super.txqp, ep->txcnt.ci + count);
-        uct_rc_ep_schedule_pending(&ep->super);
-        uct_xrc_verbs_update_tx_res(&iface->super, ep, count);
+        uct_xrc_verbs_update_tx_res(iface, nqp, count);
         ucs_arbiter_dispatch(&iface->super.tx.arbiter, 1,
                              uct_rc_ep_process_pending, NULL);
+        if (ucs_unlikely(nqp->retired &&
+                         (nqp->txcnt.pi == nqp->txcnt.ci))) {
+            uct_xrc_verbs_node_qp_destroy(nqp);
+        }
     }
 
     return num_wcs;
+}
+
+unsigned uct_xrc_verbs_iface_poll_tx_wqes(uct_xrc_verbs_iface_t *iface)
+{
+    return uct_xrc_verbs_iface_poll_tx(iface);
 }
 
 static unsigned uct_xrc_verbs_iface_progress(void *arg)
@@ -348,6 +411,7 @@ static void uct_xrc_verbs_iface_close_xrcd(uct_xrc_verbs_iface_t *iface)
 
 ucs_status_t
 uct_xrc_verbs_iface_create_ini_qp(uct_xrc_verbs_iface_t *iface,
+                                  unsigned max_send_wr,
                                   struct ibv_qp **qp_p,
                                   struct ibv_qp_cap *cap_p)
 {
@@ -363,7 +427,8 @@ uct_xrc_verbs_iface_create_ini_qp(uct_xrc_verbs_iface_t *iface,
     attr.send_cq             = ib_iface->cq[UCT_IB_DIR_TX];
     attr.recv_cq             = ib_iface->cq[UCT_IB_DIR_RX];
     attr.sq_sig_all          = !rc_iface->config.tx_moderation;
-    attr.cap.max_send_wr     = rc_iface->config.tx_qp_len;
+    attr.cap.max_send_wr     = (max_send_wr != 0) ? max_send_wr :
+                               rc_iface->config.tx_qp_len;
     attr.cap.max_recv_wr     = 0;
     attr.cap.max_send_sge    = rc_iface->config.tx_min_sge;
     attr.cap.max_recv_sge    = 0;
@@ -373,8 +438,13 @@ uct_xrc_verbs_iface_create_ini_qp(uct_xrc_verbs_iface_t *iface,
 
     qp = ibv_create_qp_ex(dev->ibv_context, &attr);
     if (qp == NULL) {
-        uct_ib_check_memlock_limit_msg(dev->ibv_context, UCS_LOG_LEVEL_ERROR,
-                                       "ibv_create_qp_ex(XRC_SEND)");
+        /* An oversized send queue is rejected rather than clamped, and the
+         * caller of a shared initiator QP lowers its request until it is
+         * granted, so only the interface probe is worth an error here. */
+        uct_ib_check_memlock_limit_msg(dev->ibv_context,
+                                      (max_send_wr != 0) ? UCS_LOG_LEVEL_DEBUG :
+                                                           UCS_LOG_LEVEL_ERROR,
+                                      "ibv_create_qp_ex(XRC_SEND)");
         return UCS_ERR_IO_ERROR;
     }
 
@@ -511,7 +581,11 @@ uct_xrc_verbs_iface_qp_cleanup(uct_rc_iface_qp_cleanup_ctx_t *rc_cleanup_ctx)
             ucs_derived_of(rc_cleanup_ctx,
                            uct_xrc_verbs_iface_qp_cleanup_ctx_t);
 
-    uct_ib_destroy_qp(cleanup_ctx->qp);
+    /* A shared initiator QP is owned by the interface, its endpoints only hold
+     * a reference to it. */
+    if (cleanup_ctx->qp != NULL) {
+        uct_ib_destroy_qp(cleanup_ctx->qp);
+    }
 }
 
 unsigned uct_xrc_verbs_post_recv_always(uct_xrc_verbs_iface_t *iface,
@@ -578,6 +652,190 @@ void uct_xrc_verbs_iface_progress_enable(uct_iface_h tl_iface, unsigned flags)
                                       iface->super.progress, flags);
 }
 
+/* Endpoints which share an initiator QP share its send queue too, so the queue
+ * has to be able to hold the operations of all of them at once. */
+#define UCT_XRC_VERBS_NODE_QP_EPS 64
+
+static uct_xrc_verbs_node_qp_t *
+uct_xrc_verbs_node_qp_lookup(uct_xrc_verbs_iface_t *iface, uint32_t qpn)
+{
+    uct_xrc_verbs_node_qp_t *nqp;
+
+    nqp = iface->last_tx_nqp;
+    if ((nqp != NULL) && (nqp->qpn == qpn)) {
+        return nqp;
+    }
+
+    ucs_list_for_each(nqp, &iface->node_qps, list) {
+        if (nqp->qpn == qpn) {
+            iface->last_tx_nqp = nqp;
+            return nqp;
+        }
+    }
+
+    return NULL;
+}
+
+static ucs_status_t
+uct_xrc_verbs_node_qp_create(uct_xrc_verbs_iface_t *iface,
+                             uct_xrc_verbs_node_qp_t **nqp_p)
+{
+    uct_xrc_verbs_node_qp_t *nqp;
+    struct ibv_qp_cap cap;
+    ucs_status_t status;
+    unsigned size, max_wr;
+
+    nqp = ucs_malloc(sizeof(*nqp), "xrc node qp");
+    if (nqp == NULL) {
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    /* The endpoints which share this QP share its send queue too, so it is
+     * sized for all of them at once. The device does not clamp an oversized
+     * request but rejects it, so the request is lowered until it is granted,
+     * and the number of endpoints the QP can serve follows from what it got. */
+    max_wr = ucs_max(iface->config.tx_max_wr, 1u) * UCT_XRC_VERBS_NODE_QP_EPS;
+    max_wr = ucs_min(max_wr,
+                     uct_ib_iface_device(&iface->super.super)->dev_attr
+                     .orig_attr.max_qp_wr);
+    for (;;) {
+        status = uct_xrc_verbs_iface_create_ini_qp(iface, max_wr, &nqp->qp,
+                                                  &cap);
+        if (status == UCS_OK) {
+            break;
+        }
+
+        if (max_wr <= iface->config.tx_max_wr) {
+            goto err_free;
+        }
+
+        max_wr = ucs_max(max_wr / 2, iface->config.tx_max_wr);
+    }
+
+    size        = ucs_roundup_pow2(ucs_max(cap.max_send_wr, 2u));
+    nqp->max_eps = ucs_max(cap.max_send_wr / iface->config.tx_max_wr, 1u);
+    nqp->eps = ucs_malloc(sizeof(*nqp->eps) * size, "xrc node qp eps");
+    if (nqp->eps == NULL) {
+        status = UCS_ERR_NO_MEMORY;
+        goto err_destroy_qp;
+    }
+
+    nqp->iface     = iface;
+    nqp->qpn       = nqp->qp->qp_num;
+    nqp->eps_mask  = size - 1;
+    nqp->refcount  = 0;
+    nqp->connected = 0;
+    nqp->retired   = 0;
+    nqp->stale_eps = 0;
+    nqp->inited    = 0;
+    nqp->shared    = 0;
+    uct_xrc_verbs_txcnt_init(&nqp->txcnt);
+    uct_ib_fence_info_init(&nqp->fi);
+    ucs_list_head_init(&nqp->list);
+    ucs_list_add_head(&iface->node_qps, &nqp->list);
+
+    ucs_trace("iface %p created initiator QP 0x%x with %u send WRs", iface,
+              nqp->qpn, cap.max_send_wr);
+
+    *nqp_p = nqp;
+    return UCS_OK;
+
+err_destroy_qp:
+    uct_ib_destroy_qp(nqp->qp);
+err_free:
+    ucs_free(nqp);
+    return status;
+}
+
+static void uct_xrc_verbs_node_qp_destroy(uct_xrc_verbs_node_qp_t *nqp)
+{
+    uct_xrc_verbs_iface_t *iface = nqp->iface;
+
+    ucs_assertv(nqp->refcount == 0, "qpn 0x%x refcount %u", nqp->qpn,
+                nqp->refcount);
+    ucs_trace("iface %p destroy initiator QP 0x%x", iface, nqp->qpn);
+
+    ucs_list_del(&nqp->list);
+    if (iface->last_tx_nqp == nqp) {
+        iface->last_tx_nqp = NULL;
+    }
+
+    uct_ib_destroy_qp(nqp->qp);
+    ucs_free(nqp->eps);
+    ucs_free(nqp);
+}
+
+ucs_status_t
+uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
+                                const uct_xrc_verbs_node_key_t *key,
+                                uct_xrc_verbs_node_qp_t **nqp_p)
+{
+    uct_xrc_verbs_node_qp_t *nqp;
+    ucs_status_t status;
+
+    if (key != NULL) {
+        ucs_list_for_each(nqp, &iface->node_qps, list) {
+            if (nqp->shared && !nqp->retired &&
+                (nqp->refcount < nqp->max_eps) &&
+                !memcmp(&nqp->key, key, sizeof(*key))) {
+                ++nqp->refcount;
+                *nqp_p = nqp;
+                return UCS_OK;
+            }
+        }
+    }
+
+    status = uct_xrc_verbs_node_qp_create(iface, &nqp);
+    if (status != UCS_OK) {
+        return status;
+    }
+
+    if (key != NULL) {
+        nqp->shared = 1;
+        nqp->key    = *key;
+        ucs_debug("iface %p share initiator QP 0x%x with all endpoints to the "
+                  "same remote node", iface, nqp->qpn);
+    }
+
+    ++nqp->refcount;
+    *nqp_p = nqp;
+    return UCS_OK;
+}
+
+void uct_xrc_verbs_node_qp_release(uct_xrc_verbs_node_qp_t *nqp)
+{
+    ucs_assertv(nqp->refcount > 0, "qpn 0x%x", nqp->qpn);
+
+    if (--nqp->refcount > 0) {
+        return;
+    }
+
+    /* No endpoint sends through it any more. Move it to error state, so that
+     * the operations which are still in flight complete, and destroy it when
+     * the last of their completions is taken from the completion queue,
+     * because the completions of a destroyed QP would name endpoints which are
+     * gone with it. */
+    nqp->retired = 1;
+    (void)uct_ib_modify_qp(nqp->qp, IBV_QPS_ERR);
+    if (nqp->txcnt.pi == nqp->txcnt.ci) {
+        uct_xrc_verbs_node_qp_destroy(nqp);
+    }
+}
+
+static void uct_xrc_verbs_node_qp_cleanup_all(uct_xrc_verbs_iface_t *iface)
+{
+    uct_xrc_verbs_node_qp_t *nqp, *tmp;
+
+    ucs_list_for_each_safe(nqp, tmp, &iface->node_qps, list) {
+        nqp->refcount = 0;
+        (void)uct_ib_modify_qp(nqp->qp, IBV_QPS_ERR);
+        uct_xrc_verbs_node_qp_destroy(nqp);
+    }
+
+    iface->last_tx_nqp = NULL;
+}
+
+
 static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
                            uct_worker_h worker,
                            const uct_iface_params_t *params,
@@ -636,6 +894,9 @@ static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
 
     self->config.tgt_state   = config->tgt_state;
     self->config.tgt_fallback = config->tgt_fallback;
+    self->config.shared_ini   = config->shared_ini;
+    ucs_list_head_init(&self->node_qps);
+    self->last_tx_nqp         = NULL;
     self->super.config.tx_moderation = ucs_min(self->super.config.tx_moderation,
                                                self->config.tx_max_wr / 4);
     self->super.config.fence_mode =
@@ -689,7 +950,7 @@ static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
 
     /* Create a dummy initiator QP in order to find out the inline and SGE
      * limits which the device grants this interface. */
-    status = uct_xrc_verbs_iface_create_ini_qp(self, &qp, &qp_cap);
+    status = uct_xrc_verbs_iface_create_ini_qp(self, 0, &qp, &qp_cap);
     if (status != UCS_OK) {
         goto err_common_cleanup;
     }
@@ -728,6 +989,7 @@ static UCS_CLASS_CLEANUP_FUNC(uct_xrc_verbs_iface_t)
     uct_base_iface_progress_disable(&self->super.super.super.super,
                                     UCT_PROGRESS_SEND | UCT_PROGRESS_RECV);
 
+    uct_xrc_verbs_node_qp_cleanup_all(self);
     uct_rc_iface_cleanup_qps(&self->super);
 
     if (self->fc_desc != NULL) {
