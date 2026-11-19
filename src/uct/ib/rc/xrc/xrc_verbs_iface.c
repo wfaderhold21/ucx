@@ -715,6 +715,9 @@ uct_xrc_verbs_node_qp_create(uct_xrc_verbs_iface_t *iface,
     ucs_status_t status;
     unsigned size, max_wr;
 
+    ++iface->nqp_alive;
+    iface->nqp_peak = ucs_max(iface->nqp_peak, iface->nqp_alive);
+
     nqp = ucs_calloc(1, sizeof(*nqp), "xrc node qp");
     if (nqp == NULL) {
         return UCS_ERR_NO_MEMORY;
@@ -811,10 +814,14 @@ uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
     if (key != NULL) {
         ucs_list_for_each(nqp, &iface->node_qps, list) {
             if (!memcmp(&nqp->key, key, sizeof(*key))) {
-                /* The same node was seen before; if its queue cannot take
-                 * another endpoint now, that is a different answer from never
-                 * having seen the node at all. */
-                if (!nqp->retired) {
+                /* The same node was seen before. Whether its queue then
+                 * refused the endpoint is a different answer from never having
+                 * seen the node at all, so only a scan which matched and was
+                 * not admitted is counted here. */
+                if (!nqp->shared || nqp->retired ||
+                    (nqp->refcount >= nqp->max_eps) ||
+                    ((uint16_t)(nqp->txcnt.pi - nqp->txcnt.ci) +
+                     iface->config.tx_max_wr > nqp->max_send_wr)) {
                     ++iface->nqp_gate_full;
                 }
             }
@@ -857,6 +864,7 @@ uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
     ++nqp->refcount;
     nqp->max_refs = ucs_max(nqp->max_refs, nqp->refcount);
     iface->nqp_shared_refs = ucs_max(iface->nqp_shared_refs, nqp->max_refs);
+    iface->eps_shared_peak   = ucs_max(iface->eps_shared_peak, nqp->refcount);
     *nqp_p = nqp;
     return UCS_OK;
 }
@@ -912,7 +920,9 @@ static void uct_xrc_verbs_iface_log_qp_usage(uct_xrc_verbs_iface_t *iface)
              (unsigned)iface->super.super.addr_size);
     ucs_info("%s: iface %p QP model: %u target QPs, %u shared initiator QPs "
              "alive / %u created (peak endpoints served by one: %u, live peak "
-             "sum %u, send queue granted %u, lookups unmatched %u refused %u), "
+             "sum %u, send queue granted %u, lookups unmatched %u refused %u) "
+             "(alive now: %u endpoints on %u queues, peak %u endpoints on %u "
+             "queues, most endpoints ever on one shared queue %u), "
              "ep decisions: "
              "%u shared, %u declined by config, %u peer address null, %u "
              "address not unpackable, %u field not passed",
@@ -920,6 +930,8 @@ static void uct_xrc_verbs_iface_log_qp_usage(uct_xrc_verbs_iface_t *iface)
              self->num_tgt_qps, shared, self->nqp_shared_created,
              self->nqp_shared_refs, total, self->nqp_last_send_wr,
              self->nqp_key_miss, self->nqp_gate_full,
+             self->eps_alive, self->nqp_alive, self->eps_peak, self->nqp_peak,
+             self->eps_shared_peak,
              self->ep_shared, self->ep_priv_cfg, self->ep_priv_addr,
              self->ep_priv_unpack, self->ep_priv_mask);
 }
@@ -1005,6 +1017,11 @@ static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
     self->nqp_last_send_wr    = 0;
     self->nqp_key_miss        = 0;
     self->poll_unknown        = 0;
+    self->eps_alive           = 0;
+    self->eps_peak            = 0;
+    self->nqp_alive           = 0;
+    self->nqp_peak            = 0;
+    self->eps_shared_peak     = 0;
     self->poll_fail           = 0;
     self->credits_reported    = 0;
     self->nqp_gate_full       = 0;

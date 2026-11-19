@@ -931,6 +931,9 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
         }
     }
 
+    ++iface->eps_alive;
+    iface->eps_peak = ucs_max(iface->eps_peak, iface->eps_alive);
+
     status = uct_xrc_verbs_iface_get_node_qp(iface, key_p, &self->nqp);
     if (status != UCS_OK) {
         goto err;
@@ -1047,6 +1050,9 @@ UCS_CLASS_CLEANUP_FUNC(uct_xrc_verbs_ep_t)
             }
         }
     }
+
+    ucs_derived_of(self->super.super.super.iface,
+                   uct_xrc_verbs_iface_t)->eps_alive--;
 
     uct_xrc_verbs_node_qp_release(self->nqp);
 }
