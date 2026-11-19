@@ -240,6 +240,7 @@ AS_IF([test "x$with_docs_only" = xyes],
      AM_CONDITIONAL([HAVE_MLX5_MMO], [false])
      AM_CONDITIONAL([HAVE_DEVX], [false])
      AM_CONDITIONAL([HAVE_TL_RC], [false])
+     AM_CONDITIONAL([HAVE_TL_XRC], [false])
      AM_CONDITIONAL([HAVE_TL_DC], [false])
      AM_CONDITIONAL([HAVE_DC_DV], [false])
      AM_CONDITIONAL([HAVE_TL_UD], [false])

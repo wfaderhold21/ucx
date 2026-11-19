@@ -45,6 +45,17 @@ libuct_ib_la_SOURCES += \
 
 endif # HAVE_TL_RC
 
+if HAVE_TL_XRC
+noinst_HEADERS += \
+	rc/xrc/xrc_verbs.h \
+	rc/xrc/xrc_verbs_impl.h
+
+libuct_ib_la_SOURCES += \
+	rc/xrc/xrc_verbs_ep.c \
+	rc/xrc/xrc_verbs_iface.c
+
+endif # HAVE_TL_XRC
+
 if HAVE_TL_UD
 noinst_HEADERS += \
 	ud/base/ud_iface_common.h \

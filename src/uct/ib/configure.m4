@@ -30,6 +30,15 @@ AC_ARG_WITH([rc],
 
 
 #
+# XRC Support
+#
+AC_ARG_WITH([xrc],
+            [AS_HELP_STRING([--with-xrc], [Compile with IB Extended Reliable Connection support])],
+            [],
+            [with_xrc=guess])
+
+
+#
 # UD Support
 #
 AC_ARG_WITH([ud],
@@ -91,6 +100,25 @@ AS_IF([test "x$with_ib" = "xyes"],
 
        AC_CHECK_DECLS([IBV_CREATE_CQ_ATTR_IGNORE_OVERRUN],
                       [have_cq_io=yes], [], [[#include <infiniband/verbs.h>]])
+
+       AS_IF([test "x$with_xrc" != xno],
+             [
+              AC_CHECK_DECLS([IBV_QPT_XRC_SEND,
+                              IBV_QPT_XRC_RECV,
+                              IBV_SRQT_XRC,
+                              IBV_QP_INIT_ATTR_XRCD,
+                              IBV_SRQ_INIT_ATTR_XRCD,
+                              IBV_XRCD_INIT_ATTR_FD,
+                              IBV_XRCD_INIT_ATTR_OFLAGS],
+                             [], [with_xrc=no], [[#include <infiniband/verbs.h>]])
+              AC_CHECK_DECLS([ibv_open_xrcd,
+                              ibv_close_xrcd,
+                              ibv_create_srq_ex,
+                              ibv_get_srq_num],
+                             [], [with_xrc=no], [[#include <infiniband/verbs.h>]])
+              AC_CHECK_MEMBERS([struct ibv_send_wr.qp_type.xrc.remote_srqn],
+                               [], [with_xrc=no], [[#include <infiniband/verbs.h>]])
+             ])
 
        AS_IF([test "x$with_mlx5" != xno], [
               have_mlx5=yes
@@ -230,6 +258,9 @@ AS_IF([test "x$with_ib" = "xyes"],
        AS_IF([test "x$with_rc" != xno],
            [AC_DEFINE([HAVE_TL_RC], 1, [RC transport support])])
 
+       AS_IF([test "x$with_xrc" != xno],
+           [AC_DEFINE([HAVE_TL_XRC], 1, [XRC transport support])])
+
        AS_IF([test "x$with_ud" != xno],
            [AC_DEFINE([HAVE_TL_UD], 1, [UD transport support])])
 
@@ -302,6 +333,7 @@ AS_IF([test "x$with_ib" = "xyes"],
         with_dc=no
         with_rc=no
         with_ud=no
+        with_xrc=no
         with_gga=no
         have_gga=no
         with_mlx5=no
@@ -313,6 +345,7 @@ AS_IF([test "x$with_ib" = "xyes"],
 AM_CONDITIONAL([HAVE_IB],      [test "x$with_ib" != xno])
 AM_CONDITIONAL([HAVE_MLX5_DV], [test "x$have_mlx5" = xyes])
 AM_CONDITIONAL([HAVE_TL_RC],   [test "x$with_rc" != xno])
+AM_CONDITIONAL([HAVE_TL_XRC],  [test "x$with_xrc" != xno])
 AM_CONDITIONAL([HAVE_TL_DC],   [test "x$with_dc" != xno])
 AM_CONDITIONAL([HAVE_DC_DV],   [test -n "$have_dc_dv"])
 AM_CONDITIONAL([HAVE_TL_UD],   [test "x$with_ud" != xno])
