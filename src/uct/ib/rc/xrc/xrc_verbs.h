@@ -219,7 +219,8 @@ typedef struct uct_xrc_verbs_iface {
     unsigned                    num_tgt_qps;  /* target QPs created, for stats */
     unsigned                    ep_shared;    /* eps given a shared initiator  */
     unsigned                    ep_priv_cfg;  /* eps declined by the config    */
-    unsigned                    ep_priv_addr; /* eps without a peer dev addr   */
+    unsigned                    ep_priv_addr; /* peer address present but null */
+    unsigned                    ep_priv_mask; /* peer address not passed at all*/
     unsigned                    ep_priv_unpack;/* eps whose address was opaque */
     struct ibv_send_wr          inl_am_wr;
     struct ibv_send_wr          inl_rwrite_wr;

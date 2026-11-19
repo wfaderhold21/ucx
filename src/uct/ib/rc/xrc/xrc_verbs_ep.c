@@ -902,7 +902,14 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
         }
 
         if (ib_addr == NULL) {
-            ++iface->ep_priv_addr;
+            /* Distinguish an upper layer which does not pass the field from
+             * one which passes it empty: they need different fixes. */
+            if ((params->field_mask & UCT_EP_PARAM_FIELD_DEV_ADDR) ||
+                (params->field_mask & UCT_EP_PARAM_FIELD_IFACE_ADDR)) {
+                ++iface->ep_priv_addr;
+            } else {
+                ++iface->ep_priv_mask;
+            }
             status = UCS_OK;
         } else {
             status = uct_ib_iface_fill_ah_attr_from_addr(

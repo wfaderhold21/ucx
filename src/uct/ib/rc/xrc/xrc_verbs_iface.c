@@ -862,12 +862,12 @@ static void uct_xrc_verbs_iface_log_qp_usage(uct_xrc_verbs_iface_t *iface)
              (unsigned)iface->super.super.addr_size);
     ucs_info("%s: iface %p QP model: %u target QPs, %u shared initiator QPs "
              "(peak endpoints served per QP: %s, %u in total), ep decisions: "
-             "%u shared, %u declined by config, %u no peer dev addr, %u "
-             "address not unpackable",
+             "%u shared, %u declined by config, %u peer address null, %u "
+             "address not unpackable, %u field not passed",
              uct_ib_device_name(uct_ib_iface_device(&self->super.super)), self,
              self->num_tgt_qps, shared, (shared ? refs : "none"), total,
              self->ep_shared, self->ep_priv_cfg, self->ep_priv_addr,
-             self->ep_priv_unpack);
+             self->ep_priv_unpack, self->ep_priv_mask);
 }
 
 static void uct_xrc_verbs_node_qp_cleanup_all(uct_xrc_verbs_iface_t *iface)
@@ -949,6 +949,7 @@ static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
     self->ep_shared           = 0;
     self->ep_priv_cfg         = 0;
     self->ep_priv_addr        = 0;
+    self->ep_priv_mask        = 0;
     self->ep_priv_unpack      = 0;
     self->super.config.tx_moderation = ucs_min(self->super.config.tx_moderation,
                                                self->config.tx_max_wr / 4);
