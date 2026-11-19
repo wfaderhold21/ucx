@@ -125,6 +125,7 @@ typedef struct uct_xrc_verbs_iface_config {
     uct_xrc_verbs_tgt_state_t          tgt_state;
     unsigned                           tgt_fallback;
     char                               *domain_dir;
+    int                                domain_shared;
 } uct_xrc_verbs_iface_config_t;
 
 

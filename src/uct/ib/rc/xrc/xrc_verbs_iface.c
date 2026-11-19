@@ -20,8 +20,10 @@
 #include <ucs/arch/cpu.h>
 #include <ucs/debug/log.h>
 #include <ucs/sys/string.h>
+#include <ucs/sys/sys.h>
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 
@@ -66,10 +68,22 @@ static ucs_config_field_t uct_xrc_verbs_iface_config_table[] = {
    UCS_CONFIG_TYPE_BOOL},
 
   {"DOMAIN_DIR", UCT_XRC_VERBS_XRCD_DIR_DEFAULT,
-   "Directory for the files which back the XRC domains. Each interface opens\n"
-   "its own domain, and the file is removed as soon as the domain is opened.\n",
+   "Directory for the files which back the XRC domains. With DOMAIN_SHARED=n\n"
+   "each interface opens its own domain, and the file is removed as soon as the\n"
+   "domain is opened. With DOMAIN_SHARED=y the file name is derived from the\n"
+   "boot id, device and port, so all processes on a node share one domain.\n",
    ucs_offsetof(uct_xrc_verbs_iface_config_t, domain_dir),
    UCS_CONFIG_TYPE_STRING},
+
+  {"DOMAIN_SHARED", "y",
+   "Share one XRC domain between all processes of a node, by backing it with a\n"
+   "file whose name depends only on the boot id, the device and the port. The\n"
+   "kernel deduplicates XRC domains by file inode and reference-counts them,\n"
+   "so every process on the node gets the same XRC domain number. The file is\n"
+   "left in place, since a peer may open it later; it disappears with the\n"
+   "tmpfs when the node is rebooted.\n",
+   ucs_offsetof(uct_xrc_verbs_iface_config_t, domain_shared),
+   UCS_CONFIG_TYPE_BOOL},
 
   {NULL}
 };
@@ -241,27 +255,42 @@ uct_xrc_verbs_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
 
 static ucs_status_t
 uct_xrc_verbs_iface_open_xrcd(uct_xrc_verbs_iface_t *iface,
-                              const char *domain_dir)
+                              const char *domain_dir, int shared)
 {
     uct_ib_device_t *dev = uct_ib_iface_device(&iface->super.super);
     struct ibv_xrcd_init_attr xrcd_attr;
+    uint64_t boot_id_high, boot_id_low;
     const char *job_id;
+    ucs_status_t status;
+    struct stat st;
     int fd;
 
-    /* The XRC domain is backed by a file, which has to outlive nothing but the
-     * domain itself: the kernel keeps the inode alive through the descriptor,
-     * so the file is removed as soon as the domain is opened. A private domain
-     * per process is enough, because an XRC connection only pairs a target QP
-     * with the shared receive queue of its own owner. */
+    /* The XRC domain is backed by a file: the driver identifies a domain by the
+     * inode behind the descriptor and reference-counts it, so every process
+     * which opens the same file is given the same domain. One shared domain per
+     * node is what lets a single XRC initiator QP and a single XRC receive
+     * queue serve all processes of the node, so in that mode the file has to
+     * stay - a peer may open it later - and it goes away with the tmpfs at the
+     * next boot. A private domain needs no persistence, because an XRC
+     * connection only pairs a target QP with the shared receive queue of its
+     * own owner, so its file is removed as soon as the domain is opened. */
     if (domain_dir == NULL) {
         domain_dir = UCT_XRC_VERBS_XRCD_DIR_DEFAULT;
     }
 
-    job_id = getenv("SLURM_JOB_ID");
-    snprintf(iface->xrcd_path, sizeof(iface->xrcd_path),
-             "%s/ucx-xrcd-%s-%s-%d-%p", domain_dir,
-             (job_id != NULL) ? job_id : "0", uct_ib_device_name(dev),
-             (int)getpid(), iface);
+    status = ucs_sys_get_boot_id(&boot_id_high, &boot_id_low);
+    if (shared && (status == UCS_OK)) {
+        snprintf(iface->xrcd_path, sizeof(iface->xrcd_path),
+                 "%s/ucx-xrcd-%016lx%016lx-%s-%d", domain_dir,
+                 (unsigned long)boot_id_high, (unsigned long)boot_id_low,
+                 uct_ib_device_name(dev), iface->super.super.config.port_num);
+    } else {
+        job_id = getenv("SLURM_JOB_ID");
+        snprintf(iface->xrcd_path, sizeof(iface->xrcd_path),
+                 "%s/ucx-xrcd-%s-%s-%d-%p", domain_dir,
+                 (job_id != NULL) ? job_id : "0", uct_ib_device_name(dev),
+                 (int)getpid(), iface);
+    }
 
     fd = open(iface->xrcd_path, O_CREAT | O_RDWR, 0600);
     if (fd < 0) {
@@ -271,6 +300,9 @@ uct_xrc_verbs_iface_open_xrcd(uct_xrc_verbs_iface_t *iface,
     }
 
     iface->xrcd_fd = fd;
+    if (fstat(fd, &st) != 0) {
+        st.st_ino = 0;
+    }
 
     memset(&xrcd_attr, 0, sizeof(xrcd_attr));
     xrcd_attr.comp_mask = IBV_XRCD_INIT_ATTR_FD | IBV_XRCD_INIT_ATTR_OFLAGS;
@@ -283,16 +315,21 @@ uct_xrc_verbs_iface_open_xrcd(uct_xrc_verbs_iface_t *iface,
                   uct_ib_device_name(dev), iface->xrcd_path);
         close(iface->xrcd_fd);
         iface->xrcd_fd = -1;
-        unlink(iface->xrcd_path);
+        if (!shared) {
+            unlink(iface->xrcd_path);
+        }
         return UCS_ERR_UNSUPPORTED;
     }
 
-    if (unlink(iface->xrcd_path) != 0) {
+    if (!shared && (unlink(iface->xrcd_path) != 0)) {
         ucs_debug("failed to remove XRC domain file %s: %m", iface->xrcd_path);
     }
 
-    ucs_trace("%s: iface %p opened XRC domain %s", uct_ib_device_name(dev),
-              iface, iface->xrcd_path);
+    /* The driver identifies a domain by the inode of its backing file, so the
+     * inode is what decides whether two processes got the same domain. */
+    ucs_info("%s: iface %p opened %s XRC domain %s inode %lu",
+             uct_ib_device_name(dev), iface, shared ? "shared" : "private",
+             iface->xrcd_path, (unsigned long)st.st_ino);
     return UCS_OK;
 }
 
@@ -407,7 +444,8 @@ uct_xrc_iface_verbs_init_rx(uct_rc_iface_t *rc_iface,
     struct ibv_srq_init_attr_ex srq_attr;
     ucs_status_t status;
 
-    status = uct_xrc_verbs_iface_open_xrcd(iface, config->domain_dir);
+    status = uct_xrc_verbs_iface_open_xrcd(iface, config->domain_dir,
+                                           config->domain_shared);
     if (status != UCS_OK) {
         return status;
     }
