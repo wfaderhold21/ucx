@@ -823,6 +823,14 @@ uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
                     ((uint16_t)(nqp->txcnt.pi - nqp->txcnt.ci) +
                      iface->config.tx_max_wr > nqp->max_send_wr)) {
                     ++iface->nqp_gate_full;
+                    ucs_info("%s: iface %p refuse initiator QP 0x%x of a known "
+                             "peer: shared %d retired %d users %u cap %u "
+                             "outstanding %u granted %u one endpoint needs %u",
+                             uct_ib_device_name(uct_ib_iface_device(&iface->super.super)),
+                             iface, nqp->qpn, nqp->shared, nqp->retired,
+                             nqp->refcount, nqp->max_eps,
+                             (uint16_t)(nqp->txcnt.pi - nqp->txcnt.ci),
+                             nqp->max_send_wr, iface->config.tx_max_wr);
                 }
             }
             if (nqp->shared && !nqp->retired &&
