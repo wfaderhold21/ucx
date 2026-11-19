@@ -784,7 +784,15 @@ uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
     if (key != NULL) {
         ucs_list_for_each(nqp, &iface->node_qps, list) {
             if (nqp->shared && !nqp->retired &&
+                /* What the queue has to have room for is the work of one more
+                 * endpoint, not a headcount of them: a queue granted only
+                 * tx_max_wr entries would otherwise serve a single endpoint
+                 * however idle it is, which is what made the sharing useless.
+                 * The send queue itself is the limit, and it cannot be
+                 * overfilled because each endpoint holds its own credits. */
                 (nqp->refcount < nqp->max_eps) &&
+                ((uint16_t)(nqp->txcnt.pi - nqp->txcnt.ci) +
+                 iface->config.tx_max_wr <= nqp->max_send_wr) &&
                 !memcmp(&nqp->key, key, sizeof(*key))) {
                 ++nqp->refcount;
                 *nqp_p = nqp;
@@ -801,6 +809,7 @@ uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
     if (key != NULL) {
         nqp->shared = 1;
         ++iface->nqp_shared_created;
+        iface->nqp_last_send_wr = nqp->max_send_wr;
         nqp->key    = *key;
         ucs_debug("iface %p share initiator QP 0x%x with all endpoints to the "
                   "same remote node", iface, nqp->qpn);
@@ -864,12 +873,12 @@ static void uct_xrc_verbs_iface_log_qp_usage(uct_xrc_verbs_iface_t *iface)
              (unsigned)iface->super.super.addr_size);
     ucs_info("%s: iface %p QP model: %u target QPs, %u shared initiator QPs "
              "alive / %u created (peak endpoints served by one: %u, live peak "
-             "sum %u), ep decisions: "
+             "sum %u, send queue granted %u), ep decisions: "
              "%u shared, %u declined by config, %u peer address null, %u "
              "address not unpackable, %u field not passed",
              uct_ib_device_name(uct_ib_iface_device(&self->super.super)), self,
              self->num_tgt_qps, shared, self->nqp_shared_created,
-             self->nqp_shared_refs, total,
+             self->nqp_shared_refs, total, self->nqp_last_send_wr,
              self->ep_shared, self->ep_priv_cfg, self->ep_priv_addr,
              self->ep_priv_unpack, self->ep_priv_mask);
 }
@@ -952,6 +961,7 @@ static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
     self->num_tgt_qps         = 0;
     self->nqp_shared_created  = 0;
     self->nqp_shared_refs     = 0;
+    self->nqp_last_send_wr    = 0;
     self->ep_shared           = 0;
     self->ep_priv_cfg         = 0;
     self->ep_priv_addr        = 0;

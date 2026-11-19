@@ -140,6 +140,7 @@ typedef struct uct_xrc_verbs_node_qp {
     int                               retired;   /* no user, draining CQEs      */
     int                               stale_eps; /* its endpoints are gone      */
     unsigned                          max_eps;   /* endpoints it can serve      */
+    unsigned                          max_send_wr;/* granted send queue depth   */
     unsigned                          max_refs;  /* peak simultaneous users     */
     uct_xrc_verbs_txcnt_t             txcnt;     /* send queue of the QP       */
     uct_ib_fence_info_t               fi;        /* fence state of the QP      */
@@ -219,6 +220,7 @@ typedef struct uct_xrc_verbs_iface {
     unsigned                    num_tgt_qps;  /* target QPs created, for stats */
     unsigned                    nqp_shared_created; /* shared QPs ever created */
     unsigned                    nqp_shared_refs;    /* peak users of one of them */
+    unsigned                    nqp_last_send_wr;   /* depth of the last one     */
     unsigned                    ep_shared;    /* eps given a shared initiator  */
     unsigned                    ep_priv_cfg;  /* eps declined by the config    */
     unsigned                    ep_priv_addr; /* peer address present but null */
