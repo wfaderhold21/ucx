@@ -336,12 +336,14 @@ uct_xrc_verbs_iface_query(uct_iface_h tl_iface, uct_iface_attr_t *iface_attr)
     /* Both the initiator and the target QP number are published. */
     iface_attr->ep_addr_len = sizeof(uct_xrc_verbs_ep_flush_addr_t);
 
-    /* The address of the interface names the node it is on, which is how an
-     * endpoint finds the shared initiator QP of its peer's node. The width is
-     * the one the device address needs, which is the whole content. */
-    iface_attr->iface_addr_len = ucs_min(
-            iface->super.super.addr_size,
-            (uint8_t)UCT_XRC_VERBS_IFACE_ADDR_MAX);
+    /* The address of the interface names the node it is on and the process it
+     * belongs to, which is how an endpoint finds the shared initiator QP of its
+     * peer. Where the device address leaves no room for the process, the
+     * address names only the node and no endpoint will share. */
+    iface_attr->iface_addr_len = iface->srqn_in_addr ?
+            (uint8_t)(UCT_XRC_VERBS_IFACE_ADDR_SRQN_OFF + sizeof(uint32_t)) :
+            ucs_min(iface->super.super.addr_size,
+                    (uint8_t)UCT_XRC_VERBS_IFACE_ADDR_MAX);
 
     return UCS_OK;
 }
@@ -895,12 +897,12 @@ uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
         iface->nqp_last_send_wr = nqp->max_send_wr;
         nqp->key    = *key;
         ucs_info("%s: iface %p initiator QP 0x%x serves lid 0x%x gid %u.%u."
-                 "%u.%u.%u.%u.%u.%u",
+                 "%u.%u.%u.%u.%u.%u srqn 0x%x",
                  uct_ib_device_name(uct_ib_iface_device(&iface->super.super)),
                  iface, nqp->qpn, key->lid,
                  key->gid.raw[8], key->gid.raw[9], key->gid.raw[10],
                  key->gid.raw[11], key->gid.raw[12], key->gid.raw[13],
-                 key->gid.raw[14], key->gid.raw[15]);
+                 key->gid.raw[14], key->gid.raw[15], key->srqn);
     }
 
     ++nqp->refcount;
@@ -993,7 +995,7 @@ static void uct_xrc_verbs_iface_log_qp_usage(uct_xrc_verbs_iface_t *iface)
              "queues, most endpoints ever on one shared queue %u), "
              "ep decisions: "
              "%u shared, %u declined by config, %u peer address null, %u "
-             "address not unpackable, %u field not passed",
+             "address not unpackable, %u field not passed, %u no peer process",
              uct_ib_device_name(uct_ib_iface_device(&self->super.super)), self,
              self->num_tgt_qps, shared, self->nqp_shared_created,
              self->nqp_shared_refs, total, self->nqp_last_send_wr,
@@ -1001,7 +1003,7 @@ static void uct_xrc_verbs_iface_log_qp_usage(uct_xrc_verbs_iface_t *iface)
              self->eps_alive, self->nqp_alive, self->eps_peak, self->nqp_peak,
              self->eps_shared_peak,
              self->ep_shared, self->ep_priv_cfg, self->ep_priv_addr,
-             self->ep_priv_unpack, self->ep_priv_mask);
+             self->ep_priv_unpack, self->ep_priv_mask, self->ep_priv_noproc);
 }
 
 static void uct_xrc_verbs_node_qp_cleanup_all(uct_xrc_verbs_iface_t *iface)
@@ -1047,6 +1049,7 @@ static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
     self->xrcd_fd         = -1;
     self->srq_num         = 0;
     self->fc_desc         = NULL;
+    self->srqn_in_addr    = 0;
 
     init_attr.fc_req_size           = sizeof(uct_rc_pending_req_t);
     init_attr.rx_hdr_len            = sizeof(uct_rc_hdr_t);
@@ -1065,6 +1068,11 @@ static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
     UCS_CLASS_CALL_SUPER_INIT(uct_rc_iface_t, &uct_xrc_verbs_iface_tl_ops,
                               &uct_xrc_verbs_iface_ops, tl_md, worker, params,
                               &config->super.super, &init_attr);
+
+    /* The process number rides behind the device address at a fixed offset,
+     * which the device address has to leave room for. */
+    self->srqn_in_addr = (self->super.super.addr_size <=
+                          UCT_XRC_VERBS_IFACE_ADDR_SRQN_OFF);
 
     self->config.tx_max_wr = ucs_min(config->tx_max_wr,
                                      self->super.config.tx_qp_len);
@@ -1217,9 +1225,24 @@ uct_xrc_verbs_iface_get_address(uct_iface_h tl_iface, uct_iface_addr_t *iface_ad
     uct_xrc_verbs_iface_t *iface     = ucs_derived_of(tl_iface,
                                                       uct_xrc_verbs_iface_t);
     uct_xrc_verbs_iface_addr_t *addr = (uct_xrc_verbs_iface_addr_t*)iface_addr;
+    uint32_t srqn_be;
+
+    if (iface->srqn_in_addr) {
+        /* Clear the gap left between the device address and the process. */
+        memset(addr->raw, 0, UCT_XRC_VERBS_IFACE_ADDR_SRQN_OFF +
+                             sizeof(srqn_be));
+    }
 
     uct_ib_iface_address_pack(&iface->super.super,
                               (uct_ib_address_t*)addr->raw);
+
+    if (iface->srqn_in_addr) {
+        /* The process, not only the node: see uct_xrc_verbs_node_key_t. */
+        srqn_be = htonl(iface->srq_num);
+        memcpy(addr->raw + UCT_XRC_VERBS_IFACE_ADDR_SRQN_OFF, &srqn_be,
+               sizeof(srqn_be));
+    }
+
     return UCS_OK;
 }
 

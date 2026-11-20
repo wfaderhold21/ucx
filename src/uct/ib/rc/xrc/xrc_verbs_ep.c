@@ -944,6 +944,17 @@ uct_xrc_verbs_ep_connect_to_ep_v2(uct_ep_h tl_ep,
     tgt_qp_num = uct_ib_unpack_uint24(xrc_addr->super.tgt_qp_num);
     ini_qp_num = uct_ib_unpack_uint24(xrc_addr->super.ini_qp_num);
 
+    /* The key the initiator QP was taken on and the destination of this
+     * endpoint have to name the same process, or the endpoint would send into
+     * a queue whose connected target belongs to another one. Both come from
+     * the address of the peer, so they can only disagree if it was misread. */
+    if (ep->nqp->shared && (ntohl(xrc_addr->super.srqn) != ep->nqp->key.srqn)) {
+        ucs_error("ep %p: the peer delivers to srqn 0x%x, but its address was "
+                  "keyed on 0x%x", ep, ntohl(xrc_addr->super.srqn),
+                  ep->nqp->key.srqn);
+        return UCS_ERR_IO_ERROR;
+    }
+
     if (!(ep->conn_flags & UCT_XRC_VERBS_EP_FLAG_INI_CONNECTED)) {
         /* Outbound operations: connect the initiator to the remote target. The
          * initiator is shared between the endpoints to one node, and which of
@@ -1046,7 +1057,9 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
     uct_xrc_verbs_iface_t *iface = ucs_derived_of(params->iface,
                                                   uct_xrc_verbs_iface_t);
     uct_xrc_verbs_node_key_t key, *key_p = NULL;
+    const uct_xrc_verbs_iface_addr_t *peer_addr;
     const uct_ib_address_t *ib_addr;
+    uint32_t srqn_be;
     struct ibv_ah_attr ah_attr;
     enum ibv_mtu path_mtu;
     ucs_status_t status;
@@ -1098,8 +1111,30 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
                  * queue per path instead of one. Keep the LID only where it
                  * is what identifies the destination. */
                 key.lid = ah_attr.is_global ? 0 : ah_attr.dlid;
-                key_p   = &key;
-                ++iface->ep_shared;
+                /* The node does not say enough: see uct_xrc_verbs_node_key_t.
+                 * The process is named by the shared receive queue which the
+                 * interface address of the peer carries, and the interface
+                 * address is the only channel which carries it this early. */
+                key.srqn = UCT_XRC_VERBS_IFACE_ADDR_SRQN_ABSENT;
+                if (iface->srqn_in_addr &&
+                    (params->field_mask & UCT_EP_PARAM_FIELD_IFACE_ADDR) &&
+                    (params->iface_addr != NULL)) {
+                    peer_addr = (const uct_xrc_verbs_iface_addr_t*)
+                            params->iface_addr;
+                    memcpy(&srqn_be,
+                           peer_addr->raw + UCT_XRC_VERBS_IFACE_ADDR_SRQN_OFF,
+                           sizeof(srqn_be));
+                    key.srqn = ntohl(srqn_be);
+                }
+
+                if (key.srqn == UCT_XRC_VERBS_IFACE_ADDR_SRQN_ABSENT) {
+                    /* An address which names no process cannot be shared: the
+                     * queue would be given to two processes at once. */
+                    ++iface->ep_priv_noproc;
+                } else {
+                    key_p = &key;
+                    ++iface->ep_shared;
+                }
             } else {
                 ucs_trace("ep %p: cannot unpack the address of the peer (%s), "
                           "use an initiator QP of its own", self,

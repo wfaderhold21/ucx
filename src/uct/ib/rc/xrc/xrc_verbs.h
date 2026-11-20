@@ -122,14 +122,25 @@ typedef struct uct_xrc_verbs_srqn_fc {
 
 
 /**
- * Identity of a remote node as seen from an endpoint: the NIC port of the peer
- * which the address of the peer interface points at. Every process of that
- * node is reached through that port, so this is what a shared initiator QP is
- * keyed by.
+ * Identity of the group of peers which may share an initiator QP: the NIC port
+ * of the peer which the address of the peer interface points at, and the shared
+ * receive queue which names the process of that node the traffic is for.
+ *
+ * The process belongs in the key, and not only the node, because an XRC
+ * initiator is bound to the target QP it was connected to. That target QP is
+ * where the responder validates an rkey against its own protection domain, and
+ * where it sends acknowledgements and read responses. The lanes which send to
+ * one process may therefore share a queue - their rkeys all belong to that
+ * process and their traffic is served by target QPs of it - while the lanes
+ * which send to two processes of one node may not, however close together
+ * those processes live. Measured: with a key of the node alone, a put to a
+ * process other than the owner of the connected target QP is refused by the
+ * responder with a remote access error.
  */
 typedef struct {
     union ibv_gid gid;   /* destination GID, when the address is global */
     uint32_t      lid;   /* destination LID, when it is not             */
+    uint32_t      srqn;  /* shared receive queue of the peer process    */
 } UCS_S_PACKED uct_xrc_verbs_node_key_t;
 
 
@@ -223,9 +234,19 @@ typedef struct uct_xrc_verbs_iface_config {
  */
 /* Interface address: the address of the device and port of the interface, so
  * that an endpoint can tell which node its peer lives on already when it is
- * created. UCP does not always pass the device address of the peer to
- * uct_ep_create(), but it always passes the interface address, so this is the
- * channel the shared initiator QP is keyed on. */
+ * created, followed at a fixed offset by the number of the shared receive queue
+ * of the interface, which names the process it belongs to. UCP does not always
+ * pass the device address of the peer to uct_ep_create(), but it always passes
+ * the interface address, so this is the channel both are keyed on.
+ *
+ * The number is at a fixed offset rather than appended because the reader is
+ * given no length to work from: it is handed the address of the peer as it was
+ * packed. Where a device address is too wide to leave room for it, the address
+ * carries no process number at all and the endpoints of the interface use
+ * initiators of their own, which is correct and merely more expensive. */
+#define UCT_XRC_VERBS_IFACE_ADDR_SRQN_OFF    24
+#define UCT_XRC_VERBS_IFACE_ADDR_SRQN_ABSENT UINT32_MAX
+
 typedef struct {
     /* uct_ib_address_t is a variable-length placeholder type, so the bytes are
      * held here at their full width and cast when used. */
@@ -245,6 +266,7 @@ typedef struct uct_xrc_verbs_iface {
     ucs_list_link_t             node_qps;     /* shared initiator QPs          */
     uct_xrc_verbs_node_qp_t    *last_tx_nqp;  /* cache for send completions    */
     unsigned                    num_tgt_qps;  /* target QPs created, for stats */
+    int                         srqn_in_addr; /* address carries the SRQ number */
     unsigned                    nqp_shared_created; /* shared QPs ever created */
     unsigned                    nqp_shared_refs;    /* peak users of one of them */
     unsigned                    nqp_last_send_wr;   /* depth of the last one     */
@@ -263,6 +285,7 @@ typedef struct uct_xrc_verbs_iface {
     unsigned                    ep_priv_addr; /* peer address present but null */
     unsigned                    ep_priv_mask; /* peer address not passed at all*/
     unsigned                    ep_priv_unpack;/* eps whose address was opaque */
+    unsigned                    ep_priv_noproc; /* no process in the address    */
     struct ibv_send_wr          inl_am_wr;
     struct ibv_send_wr          inl_rwrite_wr;
     struct ibv_sge              inl_sge[UCT_IB_MAX_IOV];
