@@ -30,6 +30,18 @@ uct_xrc_verbs_ep_fence_put(uct_xrc_verbs_iface_t *iface, uct_xrc_verbs_ep_t *ep,
                         ep->super.atomic_mr_offset);
 }
 
+/* Copy the window of the destination SRQ into every lane which sends to it. */
+static void uct_xrc_verbs_srqn_fc_sync(uct_xrc_verbs_ep_t *ep)
+{
+    uct_xrc_verbs_ep_t *other;
+
+    ucs_list_for_each(other, &ep->nqp->eps_alive, nqp_link) {
+        if (other->remote_srqn == ep->remote_srqn) {
+            other->super.fc.fc_wnd = ep->srqn_fc->fc_wnd;
+        }
+    }
+}
+
 static UCS_F_ALWAYS_INLINE void
 uct_xrc_verbs_ep_post_send(uct_xrc_verbs_iface_t *iface, uct_xrc_verbs_ep_t *ep,
                            struct ibv_send_wr *wr, int send_flags,
@@ -64,7 +76,20 @@ uct_xrc_verbs_ep_post_send(uct_xrc_verbs_iface_t *iface, uct_xrc_verbs_ep_t *ep,
                          (wr->opcode == IBV_WR_SEND) ? uct_rc_ep_packet_dump :
                                                        NULL);
 
-    ret = ibv_post_send(ep->ini_qp, wr, &bad_wr);
+    /* A shared initiator QP is connected to the target QP of one endpoint of
+     * the peer node only, so a receive completion names that target QP
+     * whichever process the message is delivered to, and cannot tell the
+     * receiver which of its endpoints it belongs to. Name it in the
+     * immediate data: the target QP of the peer endpoint paired with this
+     * one, which is unique on the receiving device and registered there. */
+    if (wr->opcode == IBV_WR_SEND) {
+        wr->opcode   = IBV_WR_SEND_WITH_IMM;
+        wr->imm_data = htonl(ep->remote_tgt_qpn);
+        ret          = ibv_post_send(ep->ini_qp, wr, &bad_wr);
+        wr->opcode   = IBV_WR_SEND;
+    } else {
+        ret = ibv_post_send(ep->ini_qp, wr, &bad_wr);
+    }
     if (ret != 0) {
         ucs_fatal("ibv_post_send() returned %d (%m)", ret);
     }
@@ -296,12 +321,24 @@ ucs_status_t uct_xrc_verbs_ep_am_short(uct_ep_h tl_ep, uint8_t id, uint64_t hdr,
 
     UCT_RC_CHECK_AM_SHORT(id, length, uct_rc_am_short_hdr_t,
                           iface->config.max_inline);
+    /* The endpoint's window is a copy of the window of its destination SRQ:
+     * let it see the real one before the check, and return the consumption
+     * after the send. */
+    if ((ep->nqp != NULL) && ep->nqp->shared && (ep->srqn_fc != NULL)) {
+        ep->super.fc.fc_wnd = ep->srqn_fc->fc_wnd;
+    }
     UCT_RC_CHECK_RES_AND_FC(&iface->super, &ep->super, id);
     uct_xrc_verbs_iface_fill_inl_am_sge(iface, id, hdr, buffer, length);
     UCT_TL_EP_STAT_OP(&ep->super.super, AM, SHORT, sizeof(hdr) + length);
     uct_xrc_verbs_ep_post_send(iface, ep, &iface->inl_am_wr,
                                IBV_SEND_INLINE | IBV_SEND_SOLICITED, INT_MAX);
     UCT_RC_UPDATE_FC(&ep->super, id);
+    if ((ep->nqp != NULL) && ep->nqp->shared && (ep->srqn_fc != NULL)) {
+        ep->srqn_fc->fc_wnd = ep->super.fc.fc_wnd;
+        if (ucs_unlikely(ep->srqn_fc->fc_wnd <= 0)) {
+            uct_xrc_verbs_srqn_fc_sync(ep);
+        }
+    }
 
     return UCS_OK;
 }
@@ -315,6 +352,12 @@ ucs_status_t uct_xrc_verbs_ep_am_short_iov(uct_ep_h tl_ep, uint8_t id,
 
     UCT_RC_CHECK_AM_SHORT(id, uct_iov_total_length(iov, iovcnt), uct_rc_hdr_t,
                           iface->config.max_inline);
+    /* The endpoint's window is a copy of the window of its destination SRQ:
+     * let it see the real one before the check, and return the consumption
+     * after the send. */
+    if ((ep->nqp != NULL) && ep->nqp->shared && (ep->srqn_fc != NULL)) {
+        ep->super.fc.fc_wnd = ep->srqn_fc->fc_wnd;
+    }
     UCT_RC_CHECK_RES_AND_FC(&iface->super, &ep->super, id);
     UCT_CHECK_IOV_SIZE(iovcnt, UCT_IB_MAX_IOV - 1,
                        "uct_xrc_verbs_ep_am_short_iov");
@@ -324,6 +367,12 @@ ucs_status_t uct_xrc_verbs_ep_am_short_iov(uct_ep_h tl_ep, uint8_t id,
     uct_xrc_verbs_ep_post_send(iface, ep, &iface->inl_am_wr,
                                IBV_SEND_INLINE | IBV_SEND_SOLICITED, INT_MAX);
     UCT_RC_UPDATE_FC(&ep->super, id);
+    if ((ep->nqp != NULL) && ep->nqp->shared && (ep->srqn_fc != NULL)) {
+        ep->srqn_fc->fc_wnd = ep->super.fc.fc_wnd;
+        if (ucs_unlikely(ep->srqn_fc->fc_wnd <= 0)) {
+            uct_xrc_verbs_srqn_fc_sync(ep);
+        }
+    }
 
     return UCS_OK;
 }
@@ -342,6 +391,12 @@ ssize_t uct_xrc_verbs_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
 
     UCT_CHECK_AM_ID(id);
 
+    /* The endpoint's window is a copy of the window of its destination SRQ:
+     * let it see the real one before the check, and return the consumption
+     * after the send. */
+    if ((ep->nqp != NULL) && ep->nqp->shared && (ep->srqn_fc != NULL)) {
+        ep->super.fc.fc_wnd = ep->srqn_fc->fc_wnd;
+    }
     UCT_RC_CHECK_RES_AND_FC(&iface->super, &ep->super, id);
     UCT_RC_IFACE_GET_TX_AM_BCOPY_DESC(&iface->super, &iface->super.tx.mp, desc,
                                       id, uct_rc_am_hdr_fill, uct_rc_hdr_t,
@@ -351,6 +406,12 @@ ssize_t uct_xrc_verbs_ep_am_bcopy(uct_ep_h tl_ep, uint8_t id,
     UCT_TL_EP_STAT_OP(&ep->super.super, AM, BCOPY, length);
     uct_xrc_verbs_ep_post_send_desc(ep, &wr, desc, IBV_SEND_SOLICITED, INT_MAX);
     UCT_RC_UPDATE_FC(&ep->super, id);
+    if ((ep->nqp != NULL) && ep->nqp->shared && (ep->srqn_fc != NULL)) {
+        ep->srqn_fc->fc_wnd = ep->super.fc.fc_wnd;
+        if (ucs_unlikely(ep->srqn_fc->fc_wnd <= 0)) {
+            uct_xrc_verbs_srqn_fc_sync(ep);
+        }
+    }
 
     return length;
 }
@@ -376,6 +437,12 @@ ucs_status_t uct_xrc_verbs_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
     UCT_RC_CHECK_AM_ZCOPY(id, header_length, uct_iov_total_length(iov, iovcnt),
                           iface->config.short_desc_size,
                           iface->super.super.config.seg_size);
+    /* The endpoint's window is a copy of the window of its destination SRQ:
+     * let it see the real one before the check, and return the consumption
+     * after the send. */
+    if ((ep->nqp != NULL) && ep->nqp->shared && (ep->srqn_fc != NULL)) {
+        ep->super.fc.fc_wnd = ep->srqn_fc->fc_wnd;
+    }
     UCT_RC_CHECK_RES_AND_FC(&iface->super, &ep->super, id);
 
     UCT_RC_IFACE_GET_TX_AM_ZCOPY_DESC(&iface->super, &iface->short_desc_mp,
@@ -391,6 +458,12 @@ ucs_status_t uct_xrc_verbs_ep_am_zcopy(uct_ep_h tl_ep, uint8_t id,
                                     send_flags | IBV_SEND_SOLICITED,
                                     UCT_IB_MAX_ZCOPY_LOG_SGE(&iface->super.super));
     UCT_RC_UPDATE_FC(&ep->super, id);
+    if ((ep->nqp != NULL) && ep->nqp->shared && (ep->srqn_fc != NULL)) {
+        ep->srqn_fc->fc_wnd = ep->super.fc.fc_wnd;
+        if (ucs_unlikely(ep->srqn_fc->fc_wnd <= 0)) {
+            uct_xrc_verbs_srqn_fc_sync(ep);
+        }
+    }
 
     return UCS_INPROGRESS;
 }
@@ -583,6 +656,88 @@ void uct_xrc_verbs_ep_vfs_populate(uct_rc_ep_t *rc_ep)
                             &ep->tgt_qp->qp_num, UCS_VFS_TYPE_U32_HEX,
                             "tgt_qp_num");
     uct_rc_txqp_vfs_populate(&ep->super.txqp, ep);
+}
+
+/* Ask the peer for flow control credit.
+ *
+ * An endpoint which has run out of credit cannot ask for more in the usual way,
+ * because the request is a bit carried by a message which is only sent once the
+ * window check has been passed: to be given credit you must send, to send you
+ * must have credit. A queue shared by the endpoints of a whole node makes that
+ * fatal, because a grant is attributed to whichever endpoint of the queue the
+ * peer's message happens to reach, and the rest can reach zero together and
+ * stay there with nothing in flight to ask for help.
+ *
+ * A flow control message is the one send which does not consult the window, so
+ * it is the way out. The peer answers a hard request with a pure grant, which
+ * the interface handler then shares between the endpoints of the queue which
+ * send to that peer. */
+static ucs_status_t
+uct_xrc_verbs_ep_fc_request(uct_xrc_verbs_ep_t *ep)
+{
+    uct_xrc_verbs_iface_t *iface =
+            ucs_derived_of(ep->super.super.super.iface,
+                           uct_xrc_verbs_iface_t);
+    struct ibv_send_wr fc_wr;
+    uct_rc_hdr_t *hdr;
+    struct ibv_sge sge;
+    int flags;
+
+    if (!iface->fc_desc) {
+        hdr                    = &iface->am_inl_hdr.rc_hdr;
+        hdr->am_id             = UCT_XRC_VERBS_FC_PURE_REQ;
+        fc_wr.sg_list          = iface->inl_sge;
+        iface->inl_sge[0].addr = (uintptr_t)hdr;
+        iface->inl_sge[0].length = sizeof(*hdr);
+        flags                  = IBV_SEND_INLINE;
+    } else {
+        hdr        = (uct_rc_hdr_t*)(iface->fc_desc + 1);
+        hdr->am_id = UCT_XRC_VERBS_FC_PURE_REQ;
+        sge.addr   = (uintptr_t)hdr;
+        sge.length = sizeof(uct_rc_hdr_t);
+        sge.lkey   = iface->fc_desc->lkey;
+        fc_wr.sg_list = &sge;
+        flags      = 0;
+    }
+
+    UCT_RC_CHECK_TX_CQ_RES(&iface->super, &ep->super);
+
+    fc_wr.opcode   = IBV_WR_SEND;
+    fc_wr.next     = NULL;
+    fc_wr.num_sge  = 1;
+
+    uct_xrc_verbs_ep_post_send(iface, ep, &fc_wr, flags, INT_MAX);
+    return UCS_OK;
+}
+
+ucs_status_t uct_xrc_verbs_ep_pending_add(uct_ep_h tl_ep, uct_pending_req_t *n,
+                                         unsigned flags)
+{
+    uct_xrc_verbs_ep_t *ep = ucs_derived_of(tl_ep, uct_xrc_verbs_ep_t);
+    ucs_status_t status;
+
+    /* The base check reads the endpoint's window, so show it the window its
+     * destination SRQ actually has. */
+    if ((ep->nqp != NULL) && ep->nqp->shared && (ep->srqn_fc != NULL)) {
+        ep->super.fc.fc_wnd = ep->srqn_fc->fc_wnd;
+    }
+
+    status = uct_rc_ep_pending_add(tl_ep, n, flags);
+
+    /* That function looks at send resources and not at credit, so an endpoint
+     * which can send but has no credit is told to retry, and the retry fails
+     the same way forever. Ask for credit here, once, until it arrives. The
+     * request is per destination SRQ, so the whole shared window is asked for. */
+    if ((status == UCS_OK) && (ep->nqp != NULL) && ep->nqp->shared &&
+        (ep->srqn_fc != NULL) && (ep->srqn_fc->fc_wnd <= 0) &&
+        !ep->srqn_fc->fc_solicited) {
+        ep->srqn_fc->fc_solicited = 1;
+        if (UCS_OK != uct_xrc_verbs_ep_fc_request(ep)) {
+            ep->srqn_fc->fc_solicited = 0;
+        }
+    }
+
+    return status;
 }
 
 ucs_status_t uct_xrc_verbs_ep_fc_ctrl(uct_ep_t *tl_ep, unsigned op,
@@ -796,7 +951,18 @@ uct_xrc_verbs_ep_connect_to_ep_v2(uct_ep_h tl_ep,
          * names the destination shared receive queue itself: the first
          * endpoint to connect brings the QP up for all of them. */
         if (ep->nqp->connected) {
-            ep->remote_srqn = ntohl(xrc_addr->super.srqn);
+            ep->remote_srqn    = ntohl(xrc_addr->super.srqn);
+            ep->remote_tgt_qpn = tgt_qp_num;
+            /* The peer of this endpoint is known now, so it can join the list
+             * its initiator QP keeps of the endpoints which send through it,
+             * and take the flow control window its destination SRQ shares. */
+            if ((ep->nqp != NULL) && ucs_list_is_empty(&ep->nqp_link)) {
+                ucs_list_add_tail(&ep->nqp->eps_alive, &ep->nqp_link);
+            }
+            ep->srqn_fc = uct_xrc_verbs_srqn_fc_get(ep->nqp, ep->remote_srqn);
+            if (ep->srqn_fc == NULL) {
+                return UCS_ERR_NO_MEMORY;
+            }
             ep->conn_flags |= UCT_XRC_VERBS_EP_FLAG_INI_CONNECTED;
             return uct_xrc_verbs_ep_tgt_connect(iface, ep, ini_qp_num,
                                                &ah_attr, path_mtu);
@@ -808,7 +974,15 @@ uct_xrc_verbs_ep_connect_to_ep_v2(uct_ep_h tl_ep,
             return status;
         }
 
-        ep->remote_srqn = ntohl(xrc_addr->super.srqn);
+        ep->remote_srqn    = ntohl(xrc_addr->super.srqn);
+        ep->remote_tgt_qpn = tgt_qp_num;
+        if ((ep->nqp != NULL) && ucs_list_is_empty(&ep->nqp_link)) {
+            ucs_list_add_tail(&ep->nqp->eps_alive, &ep->nqp_link);
+        }
+        ep->srqn_fc = uct_xrc_verbs_srqn_fc_get(ep->nqp, ep->remote_srqn);
+        if (ep->srqn_fc == NULL) {
+            return UCS_ERR_NO_MEMORY;
+        }
         ep->conn_flags |= UCT_XRC_VERBS_EP_FLAG_INI_CONNECTED;
         ep->nqp->connected = 1;
     }
@@ -987,6 +1161,9 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
     uct_xrc_verbs_txcnt_init(&self->txcnt);
     uct_ib_fence_info_init(&self->fi);
     self->remote_srqn = 0;
+    self->remote_tgt_qpn = 0;
+    self->srqn_fc     = NULL;
+    ucs_list_head_init(&self->nqp_link);
     self->conn_flags  = 0;
 
     ucs_debug("created xrc ep %p ini_qp 0x%x tgt_qp 0x%x shared %d", self,
@@ -1054,6 +1231,13 @@ UCS_CLASS_CLEANUP_FUNC(uct_xrc_verbs_ep_t)
                 self->nqp->eps[p & self->nqp->eps_mask] = NULL;
             }
         }
+    }
+
+    ucs_list_del(&self->nqp_link);
+
+    if (self->srqn_fc != NULL) {
+        uct_xrc_verbs_srqn_fc_put(self->srqn_fc);
+        self->srqn_fc = NULL;
     }
 
     ucs_derived_of(self->super.super.super.iface,

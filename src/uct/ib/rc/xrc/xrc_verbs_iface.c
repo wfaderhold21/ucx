@@ -18,6 +18,7 @@
 #include <uct/base/uct_md.h>
 #include <ucs/arch/bitops.h>
 #include <ucs/arch/cpu.h>
+#include <arpa/inet.h>
 #include <ucs/debug/log.h>
 #include <ucs/sys/string.h>
 #include <ucs/sys/sys.h>
@@ -779,6 +780,8 @@ uct_xrc_verbs_node_qp_create(uct_xrc_verbs_iface_t *iface,
     uct_xrc_verbs_txcnt_init(&nqp->txcnt);
     uct_ib_fence_info_init(&nqp->fi);
     ucs_list_head_init(&nqp->list);
+    ucs_list_head_init(&nqp->eps_alive);
+    ucs_list_head_init(&nqp->srqn_fcs);
     ucs_list_add_head(&iface->node_qps, &nqp->list);
 
     ucs_trace("iface %p created initiator QP 0x%x with %u send WRs", iface,
@@ -809,6 +812,14 @@ static void uct_xrc_verbs_node_qp_destroy(uct_xrc_verbs_node_qp_t *nqp)
 
     uct_ib_destroy_qp(nqp->qp);
     ucs_free(nqp->eps);
+    {
+        uct_xrc_verbs_srqn_fc_t *sf, *sf_tmp;
+
+        ucs_list_for_each_safe(sf, sf_tmp, &nqp->srqn_fcs, list) {
+            ucs_list_del(&sf->list);
+            ucs_free(sf);
+        }
+    }
     ucs_free(nqp);
 }
 
@@ -1231,7 +1242,7 @@ static uct_iface_ops_t uct_xrc_verbs_iface_tl_ops = {
                                 ucs_empty_function_return_unsupported,
     .ep_atomic32_fetch        = (uct_ep_atomic32_fetch_func_t)
                                 ucs_empty_function_return_unsupported,
-    .ep_pending_add           = uct_rc_ep_pending_add,
+    .ep_pending_add           = uct_xrc_verbs_ep_pending_add,
     .ep_pending_purge         = uct_rc_ep_pending_purge,
     .ep_flush                 = uct_xrc_verbs_ep_flush,
     .ep_fence                 = uct_xrc_verbs_ep_fence,
@@ -1253,6 +1264,202 @@ static uct_iface_ops_t uct_xrc_verbs_iface_tl_ops = {
     .iface_get_device_address = uct_ib_iface_get_device_address,
     .iface_is_reachable       = uct_base_iface_is_reachable,
 };
+
+/* Flow control in this transport carries its information in the message id byte
+ * alone, so a grant names no endpoint: the generic handler attributes it to the
+ * endpoint which owns the target QP the grant arrived on, restores that one
+ * endpoint's window and schedules that one endpoint. It is right while one queue
+ * serves one pair of endpoints. Here a queue is shared by every endpoint of this
+ * process which sends to a node, so the endpoints which are not the one the grant
+ * happened to reach never have their window replenished: they wait for credit
+ * which will not come, without an error and without a completion.
+ *
+ * This handler lets the grant serve the peer it was issued for. The endpoints are
+ * taken from the list which the queue keeps of the endpoints using it, which the
+ * transport maintains itself: the interface's table of endpoints indexed by QP
+ * number was the first idea and it crashed, because casting whatever is found
+ * there to an endpoint of this transport is only sound if every entry belongs to
+ * this transport and is fully constructed at that instant, and endpoints are
+ * created and destroyed continuously while a run wires up and tears down.
+ *
+ * The credit is divided rather than given in full to each endpoint. The peer's
+ * receive queue is one resource shared by all of them, so handing each a full
+ * window would put several windows of traffic into it, which is not a wider flow
+ * control but the overrun of it. */
+static uct_xrc_verbs_srqn_fc_t *
+uct_xrc_verbs_srqn_fc_find(uct_xrc_verbs_node_qp_t *nqp, uint32_t srqn)
+{
+    uct_xrc_verbs_srqn_fc_t *sf;
+
+    ucs_list_for_each(sf, &nqp->srqn_fcs, list) {
+        if (sf->srqn == srqn) {
+            return sf;
+        }
+    }
+    return NULL;
+}
+
+uct_xrc_verbs_srqn_fc_t *
+uct_xrc_verbs_srqn_fc_get(uct_xrc_verbs_node_qp_t *nqp, uint32_t srqn)
+{
+    uct_xrc_verbs_srqn_fc_t *sf;
+
+    sf = uct_xrc_verbs_srqn_fc_find(nqp, srqn);
+    if (sf != NULL) {
+        ++sf->num_eps;
+        return sf;
+    }
+
+    sf = ucs_malloc(sizeof(*sf), "xrc srqn fc");
+    if (sf == NULL) {
+        return NULL;
+    }
+    sf->srqn         = srqn;
+    sf->fc_wnd       = nqp->iface->super.config.fc_wnd_size;
+    sf->fc_solicited = 0;
+    sf->num_eps      = 1;
+    ucs_list_add_tail(&nqp->srqn_fcs, &sf->list);
+    return sf;
+}
+
+void uct_xrc_verbs_srqn_fc_put(uct_xrc_verbs_srqn_fc_t *srqn_fc)
+{
+    ucs_assertv(srqn_fc->num_eps > 0, "srqn %u num_eps %u",
+                srqn_fc->srqn, srqn_fc->num_eps);
+    if (--srqn_fc->num_eps > 0) {
+        return;
+    }
+    ucs_list_del(&srqn_fc->list);
+    ucs_free(srqn_fc);
+}
+
+/* Resolve the target QP named in the immediate data to an endpoint of this
+ * interface. The number is checked against the table rather than indexed
+ * blindly: a chunk of it is only allocated for numbers this process created. */
+static uct_xrc_verbs_ep_t *
+uct_xrc_verbs_iface_lookup_tgt(uct_rc_iface_t *rc_iface, uint32_t qpn)
+{
+    uct_rc_ep_t **chunk;
+    uct_rc_ep_t *rc_ep;
+
+    if ((qpn == 0) || (qpn >= UCS_BIT(UCT_IB_QPN_ORDER))) {
+        return NULL;
+    }
+
+    chunk = rc_iface->eps[qpn >> UCT_RC_QP_TABLE_ORDER];
+    if (chunk == NULL) {
+        return NULL;
+    }
+
+    rc_ep = chunk[qpn & UCS_MASK(UCT_RC_QP_TABLE_MEMB_ORDER)];
+    return (rc_ep == NULL) ? NULL : ucs_derived_of(rc_ep, uct_xrc_verbs_ep_t);
+}
+
+/* Answer a credit request of the peer paired with @a self by a pure grant,
+ * queued at the head of its pending queue if it cannot be sent now. */
+static ucs_status_t
+uct_xrc_verbs_iface_fc_grant(uct_rc_iface_t *rc_iface, uct_xrc_verbs_ep_t *self)
+{
+    uct_rc_pending_req_t *fc_req;
+    ucs_status_t status;
+
+    fc_req = ucs_mpool_get(&rc_iface->tx.pending_mp);
+    if (ucs_unlikely(fc_req == NULL)) {
+        ucs_error("xrc ep %p: failed to allocate FC request", self);
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    fc_req->ep         = &self->super.super.super;
+    fc_req->super.func = uct_rc_ep_fc_grant;
+    status             = uct_rc_ep_fc_grant(&fc_req->super);
+    if (status == UCS_ERR_NO_RESOURCE) {
+        uct_pending_req_arb_group_push_head(&self->super.arb_group,
+                                            &fc_req->super);
+        ucs_arbiter_group_schedule(&rc_iface->tx.arbiter,
+                                   &self->super.arb_group);
+    } else if (status != UCS_OK) {
+        ucs_mpool_put(fc_req);
+    }
+
+    return UCS_OK;
+}
+
+static ucs_status_t
+uct_xrc_verbs_iface_fc_handler(uct_rc_iface_t *rc_iface, unsigned qp_num,
+                              uct_rc_hdr_t *hdr, unsigned length,
+                              uint32_t imm_data, uint16_t lid, unsigned flags)
+{
+    uint8_t fc_hdr   = uct_rc_fc_get_fc_hdr(hdr->am_id);
+    uint32_t tgt_qpn = ntohl(imm_data);
+    uct_xrc_verbs_ep_t *self, *other;
+    uct_xrc_verbs_srqn_fc_t *sf;
+    ucs_status_t status;
+    unsigned granted = 0;
+
+    /* wc.qp_num names whichever target QP the sender's shared initiator is
+     * connected to, which may belong to another process of this node. The
+     * sender names the endpoint paired with it in the immediate data. */
+    self = uct_xrc_verbs_iface_lookup_tgt(rc_iface, tgt_qpn);
+
+    ucs_trace("%s: iface %p flow control message on wc qp 0x%x, paired target "
+              "0x%x -> ep %p, hdr 0x%x",
+              uct_ib_device_name(uct_ib_iface_device(&rc_iface->super.super)),
+              rc_iface, qp_num, tgt_qpn, self, fc_hdr);
+
+    if ((self != NULL) &&
+        (self->super.flags & (UCT_RC_EP_FLAG_FLUSH_CANCEL |
+                              UCT_RC_EP_FLAG_ERR_HANDLER_INVOKED))) {
+        self = NULL;
+    }
+
+    if (fc_hdr == UCT_XRC_VERBS_FC_PURE_REQ) {
+        /* Explicit request without payload. */
+        return (self != NULL) ? uct_xrc_verbs_iface_fc_grant(rc_iface, self) :
+                                UCS_OK;
+    }
+
+    if (self == NULL) {
+        /* No endpoint here pairs with the sender any more (or yet): the flow
+         * control part is lost, as in RC, but the payload must be delivered. */
+        if (fc_hdr == UCT_RC_EP_FC_PURE_GRANT) {
+            return UCS_OK;
+        }
+        return uct_iface_invoke_am(&rc_iface->super.super,
+                                   hdr->am_id & ~UCT_RC_EP_FC_MASK, hdr + 1,
+                                   length, flags);
+    }
+
+    /* The peer's SRQ is one resource, so a grant is credit for the window all
+     * lanes to it share: refill it before the generic handler dispatches the
+     * pending sends of this lane, which read it. */
+    sf = (self->nqp != NULL) && self->nqp->shared ? self->srqn_fc : NULL;
+    if ((fc_hdr & UCT_RC_EP_FLAG_FC_GRANT) && (sf != NULL)) {
+        sf->fc_wnd       = rc_iface->config.fc_wnd_size;
+        sf->fc_solicited = 0;
+        ucs_list_for_each(other, &self->nqp->eps_alive, nqp_link) {
+            if (other->remote_srqn == self->remote_srqn) {
+                other->super.fc.fc_wnd = sf->fc_wnd;
+                ++granted;
+            }
+        }
+    }
+
+    /* Soft/hard requests, the grant of this lane and the payload. */
+    status = uct_rc_iface_fc_handler(rc_iface, tgt_qpn, hdr, length, imm_data,
+                                     lid, flags);
+
+    if (granted > 0) {
+        ucs_list_for_each(other, &self->nqp->eps_alive, nqp_link) {
+            if (other->remote_srqn == self->remote_srqn) {
+                ucs_arbiter_group_schedule(&rc_iface->tx.arbiter,
+                                           &other->super.arb_group);
+            }
+        }
+        uct_rc_iface_arbiter_dispatch(rc_iface);
+    }
+
+    return status;
+}
 
 static uct_rc_iface_ops_t uct_xrc_verbs_iface_ops = {
     .super = {
@@ -1280,7 +1487,7 @@ static uct_rc_iface_ops_t uct_xrc_verbs_iface_ops = {
     .init_rx         = uct_xrc_iface_verbs_init_rx,
     .cleanup_rx      = uct_xrc_iface_verbs_cleanup_rx,
     .fc_ctrl         = uct_xrc_verbs_ep_fc_ctrl,
-    .fc_handler      = uct_rc_iface_fc_handler,
+    .fc_handler      = uct_xrc_verbs_iface_fc_handler,
     .cleanup_qp      = uct_xrc_verbs_iface_qp_cleanup,
     .ep_post_check   = uct_xrc_verbs_ep_post_check,
     .ep_vfs_populate = uct_xrc_verbs_ep_vfs_populate

@@ -22,6 +22,7 @@
 
 typedef struct uct_xrc_verbs_iface        uct_xrc_verbs_iface_t;
 typedef struct uct_xrc_verbs_node_qp      uct_xrc_verbs_node_qp_t;
+typedef struct uct_xrc_verbs_srqn_fc      uct_xrc_verbs_srqn_fc_t;
 typedef struct uct_xrc_verbs_ep           uct_xrc_verbs_ep_t;
 
 
@@ -99,6 +100,27 @@ typedef struct uct_xrc_verbs_txcnt {
 } uct_xrc_verbs_txcnt_t;
 
 
+/* An explicit credit request: no payload, answered with a pure grant. No
+ * active message carries both request bits, so the pair is unambiguous. */
+#define UCT_XRC_VERBS_FC_PURE_REQ \
+    (UCT_RC_EP_FLAG_FC_HARD_REQ | UCT_RC_EP_FLAG_FC_SOFT_REQ)
+
+/* Flow control state of one destination shared receive queue, which is one
+ * remote process. Every lane which sends to that process delivers into the
+ * same SRQ, so the credit is a property of the destination queue, not of any
+ * one lane: the lanes share one window. The generic per-endpoint flow control
+ * checks and decrements the endpoint's window, so each lane mirrors the shared
+ * window into its own before a send and writes it back after, which the single
+ * UCP worker thread makes safe. */
+typedef struct uct_xrc_verbs_srqn_fc {
+    uint32_t          srqn;
+    int16_t           fc_wnd;       /* credit left for the destination SRQ   */
+    int               fc_solicited; /* a grant was asked for, not yet got    */
+    unsigned          num_eps;      /* lanes sharing it now                  */
+    ucs_list_link_t   list;         /* entry in nqp->srqn_fcs                */
+} uct_xrc_verbs_srqn_fc_t;
+
+
 /**
  * Identity of a remote node as seen from an endpoint: the NIC port of the peer
  * which the address of the peer interface points at. Every process of that
@@ -129,7 +151,9 @@ typedef struct {
  */
 typedef struct uct_xrc_verbs_node_qp {
     uct_xrc_verbs_iface_t            *iface;
-    ucs_list_link_t                   list;     /* entry in iface->node_qps    */
+    ucs_list_link_t                   list;        /* entry in iface->node_qps    */
+    ucs_list_link_t                   eps_alive;   /* endpoints using it now      */
+    ucs_list_link_t                   srqn_fcs;    /* destination SRQ windows     */
     struct ibv_qp                    *qp;
     uint32_t                          qpn;      /* qp->qp_num, cached          */
     uct_xrc_verbs_node_key_t          key;      /* peer NIC port of the node   */
@@ -161,6 +185,9 @@ typedef struct uct_xrc_verbs_ep {
     struct ibv_qp         *ini_qp;      /* = nqp->qp, outbound operations     */
     struct ibv_qp         *tgt_qp;      /* XRC_RECV: inbound operations       */
     uint32_t               remote_srqn; /* destination SRQ number             */
+    uint32_t               remote_tgt_qpn; /* target QP of the paired peer ep */
+    ucs_list_link_t        nqp_link;     /* on the initiator QP's endpoint list */
+    uct_xrc_verbs_srqn_fc_t *srqn_fc;    /* window of the destination SRQ       */
     uint8_t                conn_flags;  /* UCT_XRC_VERBS_EP_FLAG_xx           */
 } uct_xrc_verbs_ep_t;
 
@@ -268,6 +295,16 @@ uct_xrc_verbs_iface_get_node_qp(uct_xrc_verbs_iface_t *iface,
 void uct_xrc_verbs_node_qp_release(uct_xrc_verbs_node_qp_t *nqp);
 
 
+/* Find or create the flow control window of the destination SRQ @a srqn on
+ * @a nqp, and take a reference. Returns NULL on allocation failure. */
+uct_xrc_verbs_srqn_fc_t *
+uct_xrc_verbs_srqn_fc_get(uct_xrc_verbs_node_qp_t *nqp, uint32_t srqn);
+
+/* Drop a reference to a destination SRQ window; destroy it when the last lane
+ * which shared it leaves. */
+void uct_xrc_verbs_srqn_fc_put(uct_xrc_verbs_srqn_fc_t *srqn_fc);
+
+
 UCS_CLASS_DECLARE(uct_xrc_verbs_ep_t, const uct_ep_params_t *);
 UCS_CLASS_DECLARE_NEW_FUNC(uct_xrc_verbs_ep_t, uct_ep_t,
                            const uct_ep_params_t *);
@@ -369,6 +406,9 @@ ucs_status_t uct_xrc_verbs_ep_post_check(uct_ep_h tl_ep,
                                          uct_completion_t *comp);
 
 void uct_xrc_verbs_ep_vfs_populate(uct_rc_ep_t *rc_ep);
+
+ucs_status_t uct_xrc_verbs_ep_pending_add(uct_ep_h tl_ep,
+                                          uct_pending_req_t *n, unsigned flags);
 
 ucs_status_t uct_xrc_verbs_ep_fc_ctrl(uct_ep_t *tl_ep, unsigned op,
                                       uct_rc_pending_req_t *req);
