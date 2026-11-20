@@ -1064,11 +1064,14 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
     enum ibv_mtu path_mtu;
     ucs_status_t status;
 
-    /* All the endpoints of this process which talk to one remote node share
-     * the initiator QP of that node: an XRC work request names the destination
-     * shared receive queue itself, so the QP only fixes the node. The address
-     * of the peer names it, and it is known here because UCP passes it. With
-     * SHARED_INI=n no key is given, and the endpoint gets a QP of its own. */
+    /* The endpoints of this process which talk to one remote process share the
+     * initiator QP of that process: an XRC work request names the destination
+     * shared receive queue itself, so one queue can serve the lanes to one
+     * process. It cannot serve the lanes to two of them, because the QP is
+     * bound to the target QP it was connected to, and that target QP is what
+     * validates an rkey. The address of the peer names both, and it is known
+     * here because UCP passes it. With SHARED_INI=n no key is given, and the
+     * endpoint gets a QP of its own. */
     if (!iface->config.shared_ini) {
         ++iface->ep_priv_cfg;
     } else {

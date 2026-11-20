@@ -86,13 +86,15 @@ static ucs_config_field_t uct_xrc_verbs_iface_config_table[] = {
    ucs_offsetof(uct_xrc_verbs_iface_config_t, domain_shared),
    UCS_CONFIG_TYPE_BOOL},
 
-  {"SHARED_INI", "n",
-   "Share one XRC initiator QP between all endpoints which send to the same\n"
-   "remote node. An XRC work request names the destination shared receive\n"
-   "queue itself, so one initiator QP can serve every process of a node, which\n"
-   "is the QP-count saving XRC exists for. With \"n\" every endpoint gets an\n"
-   "initiator QP of its own, as in\n"
-   "the first version of this transport.\n",
+  {"SHARED_INI", "y",
+   "Share one XRC initiator QP between all the endpoints which send to the same\n"
+   "remote process. An XRC work request names the destination shared receive\n"
+   "queue itself, so the lanes to one process can serve from a single initiator\n"
+   "QP, which is the QP-count saving XRC exists for. They cannot be shared\n"
+   "between two processes of one node, because an initiator is bound to the\n"
+   "target QP it was connected to and it is that target QP whose protection\n"
+   "domain validates an rkey. With \"n\" every endpoint gets an initiator QP of\n"
+   "its own, as in the first version of this transport.\n",
    ucs_offsetof(uct_xrc_verbs_iface_config_t, shared_ini),
    UCS_CONFIG_TYPE_BOOL},
 
@@ -960,8 +962,8 @@ void uct_xrc_verbs_node_qp_release(uct_xrc_verbs_node_qp_t *nqp)
 }
 
 /* Report what the interface ended up using, which is the measurement of the QP
- * model: with SHARED_INI=y the initiator QPs are the remote nodes, and every
- * endpoint to one of them is a reference on the QP of that node. */
+ * model: with SHARED_INI=y the initiator QPs are the remote processes, and
+ * every endpoint to one of them is a reference on the QP of that process. */
 static void uct_xrc_verbs_iface_log_qp_usage(uct_xrc_verbs_iface_t *iface)
 {
     uct_xrc_verbs_iface_t *self = iface;

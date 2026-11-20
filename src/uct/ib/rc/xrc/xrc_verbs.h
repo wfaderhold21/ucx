@@ -147,14 +147,18 @@ typedef struct {
 /**
  * Shared XRC initiator QP.
  *
- * One initiator QP serves every endpoint which sends to the same remote node,
- * because an XRC work request names the destination shared receive queue
- * itself (wr.qp_type.xrc.remote_srqn): the destination node is fixed by the
- * QP, the destination process by the work request. The key is the device
- * address of the peer, so all endpoints of a process which talk to one node
- * share a single QP, which is the QP-count saving XRC exists for. With
- * SHARED_INI=n the key is made unique per endpoint, which reproduces the
- * one-initiator-QP-per-endpoint behaviour.
+ * One initiator QP serves every endpoint which sends to the same remote
+ * process, because an XRC work request names the destination shared receive
+ * queue itself (wr.qp_type.xrc.remote_srqn). A SEND is steered by that number
+ * and so may reach any process the queue is bound to, but a work request is
+ * not enough on its own: the QP is connected to one target QP, and the
+ * responder runs an RDMA or atomic request in the context of that target QP,
+ * whose protection domain validates the rkey and whose address receives the
+ * acknowledgements and read responses. The key is therefore the device address
+ * of the peer together with its shared receive queue, and the endpoints which
+ * talk to one process share a single QP, which is the QP-count saving XRC
+ * exists for. With SHARED_INI=n the key is made unique per endpoint, which
+ * reproduces the one-initiator-QP-per-endpoint behaviour.
  *
  * A send completion names the QP, not the endpoint, so the endpoints are
  * recorded in post order and completed in that order, which the in-order send
@@ -167,7 +171,7 @@ typedef struct uct_xrc_verbs_node_qp {
     ucs_list_link_t                   srqn_fcs;    /* destination SRQ windows     */
     struct ibv_qp                    *qp;
     uint32_t                          qpn;      /* qp->qp_num, cached          */
-    uct_xrc_verbs_node_key_t          key;      /* peer NIC port of the node   */
+    uct_xrc_verbs_node_key_t          key;      /* peer NIC port and SRQ      */
     int                               shared;   /* looked up by key            */
     unsigned                          refcount;
     int                               connected; /* initiator reached RTS       */
@@ -305,8 +309,9 @@ typedef struct uct_xrc_verbs_iface {
 } uct_xrc_verbs_iface_t;
 
 
-/* Look up the shared initiator QP of the node which @a dev_addr belongs to,
- * create it if this is the first endpoint to that node, and take a reference.
+/* Look up the shared initiator QP of the peer process which @a key names,
+ * create it if this is the first endpoint to that process, and take a
+ * reference.
  * With SHARED_INI=n, @a key is ignored and a QP of its own is given to every
  * endpoint. @a key must be unique per endpoint in that case. */
 ucs_status_t
