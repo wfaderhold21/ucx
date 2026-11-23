@@ -98,6 +98,35 @@ static ucs_config_field_t uct_xrc_verbs_iface_config_table[] = {
    ucs_offsetof(uct_xrc_verbs_iface_config_t, shared_ini),
    UCS_CONFIG_TYPE_BOOL},
 
+  {"SHARED_TGT", "y",
+   "Share one XRC target QP between all the endpoints which pair with the same\n"
+   "remote process. With a shared initiator QP the peer sends every lane through\n"
+   "one QP, and that QP is connected to one target QP only, so a target QP per\n"
+   "endpoint leaves all but one of them idle. Requires SHARED_INI=y; the\n"
+   "receiving endpoint is named by a token in the immediate data.\n",
+   ucs_offsetof(uct_xrc_verbs_iface_config_t, shared_tgt),
+   UCS_CONFIG_TYPE_BOOL},
+
+  {"INI_SCOPE", "process",
+   "What one shared initiator QP serves:\n"
+   " - process : the lanes to one remote process (validated default).\n"
+   " - node    : the lanes to every process of a remote node. Experimental:\n"
+   "             correct only if the responder validates the rkey of an RDMA or\n"
+   "             atomic request against the destination SRQ of the request, not\n"
+   "             against the target QP it arrived on. Size TX_MAX_WR so one\n"
+   "             queue can hold all the lanes to a node, or the queue splits\n"
+   "             and shared target QPs report connect conflicts.\n",
+   ucs_offsetof(uct_xrc_verbs_iface_config_t, ini_scope),
+   UCS_CONFIG_TYPE_ENUM(uct_xrc_verbs_ini_scope_names)},
+
+  {"TGT_PD", "y",
+   "Create the XRC target QP with the protection domain of this process. With\n"
+   "\"n\" the target QP is created with the XRC domain alone, as the reference\n"
+   "raw-verbs program does, so that its access checks can only come from the\n"
+   "destination SRQ.\n",
+   ucs_offsetof(uct_xrc_verbs_iface_config_t, tgt_pd),
+   UCS_CONFIG_TYPE_BOOL},
+
   {NULL}
 };
 
@@ -182,15 +211,12 @@ static void uct_xrc_verbs_handle_failure(uct_ib_iface_t *ib_iface, void *arg,
         ep = nqp->eps[nqp->txcnt.ci & nqp->eps_mask];
         uct_xrc_verbs_update_tx_res(iface_xrc, nqp, count);
     } else {
-        ep = ucs_derived_of(uct_rc_iface_lookup_ep(iface, wc->qp_num),
-                            uct_xrc_verbs_ep_t);
-        if (!ep) {
-            return;
-        }
-
-        count = 0;
-        uct_rc_txqp_purge_outstanding(iface, &ep->super.txqp, ep_status,
-                                      ep->txcnt.ci + count, 0);
+        /* Every send queue of this transport is an initiator QP in the list:
+         * the target QPs have none, and no QP is in the QP number table. */
+        ucs_debug("%s: send completion of unknown QP 0x%x: %s",
+                 uct_ib_device_name(uct_ib_iface_device(ib_iface)), wc->qp_num,
+                 ibv_wc_status_str(wc->status));
+        return;
     }
 
     ucs_arbiter_group_purge(&iface->tx.arbiter, &ep->super.arb_group,
@@ -507,9 +533,12 @@ uct_xrc_verbs_iface_create_tgt_qp(uct_xrc_verbs_iface_t *iface,
     attr.send_cq   = ib_iface->cq[UCT_IB_DIR_TX];
     attr.recv_cq   = ib_iface->cq[UCT_IB_DIR_RX];
     attr.srq       = iface->srq;
-    attr.comp_mask = IBV_QP_INIT_ATTR_PD | IBV_QP_INIT_ATTR_XRCD;
-    attr.pd        = md->pd;
+    attr.comp_mask = IBV_QP_INIT_ATTR_XRCD;
     attr.xrcd      = iface->xrcd;
+    if (iface->config.tgt_pd) {
+        attr.comp_mask |= IBV_QP_INIT_ATTR_PD;
+        attr.pd         = md->pd;
+    }
 
     qp = ibv_create_qp_ex(dev->ibv_context, &attr);
     if (qp == NULL) {
@@ -961,6 +990,136 @@ void uct_xrc_verbs_node_qp_release(uct_xrc_verbs_node_qp_t *nqp)
     }
 }
 
+static void uct_xrc_verbs_tgt_destroy(uct_xrc_verbs_iface_t *iface,
+                                      uct_xrc_verbs_tgt_t *tgt)
+{
+    ucs_list_del(&tgt->list);
+    (void)uct_ib_modify_qp(tgt->qp, IBV_QPS_ERR);
+    /* A target QP has no send queue and its receive queue is the interface
+     * SRQ, so it owns no completion queue entries and can go right away. */
+    uct_ib_destroy_qp(tgt->qp);
+    --iface->tgt_alive;
+    ucs_free(tgt);
+}
+
+ucs_status_t
+uct_xrc_verbs_iface_get_tgt(uct_xrc_verbs_iface_t *iface,
+                            const uct_xrc_verbs_node_key_t *key,
+                            uct_xrc_verbs_tgt_t **tgt_p)
+{
+    uct_xrc_verbs_tgt_t *tgt;
+    ucs_status_t status;
+
+    if (key != NULL) {
+        ucs_list_for_each(tgt, &iface->tgts, list) {
+            if (tgt->shared && !memcmp(&tgt->key, key, sizeof(*key))) {
+                ++tgt->refcount;
+                tgt->max_refs        = ucs_max(tgt->max_refs, tgt->refcount);
+                iface->tgt_refs_peak = ucs_max(iface->tgt_refs_peak,
+                                               tgt->max_refs);
+                *tgt_p = tgt;
+                return UCS_OK;
+            }
+        }
+    }
+
+    tgt = ucs_calloc(1, sizeof(*tgt), "xrc tgt qp");
+    if (tgt == NULL) {
+        return UCS_ERR_NO_MEMORY;
+    }
+
+    status = uct_xrc_verbs_iface_create_tgt_qp(iface, &tgt->qp);
+    if (status != UCS_OK) {
+        ucs_free(tgt);
+        return status;
+    }
+
+    if (key != NULL) {
+        tgt->key    = *key;
+        tgt->shared = 1;
+        ++iface->tgt_shared_created;
+    }
+
+    tgt->refcount = tgt->max_refs = 1;
+    iface->tgt_refs_peak = ucs_max(iface->tgt_refs_peak, 1u);
+    ++iface->tgt_alive;
+    ucs_list_add_tail(&iface->tgts, &tgt->list);
+    *tgt_p = tgt;
+    return UCS_OK;
+}
+
+void uct_xrc_verbs_tgt_release(uct_xrc_verbs_iface_t *iface,
+                               uct_xrc_verbs_tgt_t *tgt)
+{
+    ucs_assert(tgt->refcount > 0);
+    if (--tgt->refcount > 0) {
+        return;
+    }
+
+    /* The initiator of the peer process stays connected to a shared target QP
+     * after the last lane which paired with it is gone, and a new lane to the
+     * same process will publish it again: keep it, as the shared initiator QP
+     * is kept. */
+    if (tgt->shared) {
+        return;
+    }
+
+    uct_xrc_verbs_tgt_destroy(iface, tgt);
+}
+
+static void uct_xrc_verbs_tgt_cleanup_all(uct_xrc_verbs_iface_t *iface)
+{
+    uct_xrc_verbs_tgt_t *tgt, *tmp;
+
+    ucs_list_for_each_safe(tgt, tmp, &iface->tgts, list) {
+        uct_xrc_verbs_tgt_destroy(iface, tgt);
+    }
+}
+
+uint32_t uct_xrc_verbs_iface_ep_token_alloc(uct_xrc_verbs_iface_t *iface,
+                                            uct_xrc_verbs_ep_t *ep)
+{
+    unsigned idx = ucs_ptr_array_insert(&iface->ep_table, ep);
+    uint32_t gen;
+
+    if ((idx + 1) > UCT_XRC_VERBS_EP_TOKEN_IDX_MASK) {
+        ucs_ptr_array_remove(&iface->ep_table, idx);
+        return 0;
+    }
+
+    gen = ++iface->ep_token_gen &
+          UCS_MASK(32 - UCT_XRC_VERBS_EP_TOKEN_IDX_BITS);
+    return (gen << UCT_XRC_VERBS_EP_TOKEN_IDX_BITS) | (idx + 1);
+}
+
+void uct_xrc_verbs_iface_ep_token_free(uct_xrc_verbs_iface_t *iface,
+                                       uint32_t token)
+{
+    unsigned idx = (token & UCT_XRC_VERBS_EP_TOKEN_IDX_MASK) - 1;
+
+    ucs_ptr_array_remove(&iface->ep_table, idx);
+}
+
+/* Resolve the token carried in the immediate data of a message to the endpoint
+ * it names, checking the generation, so that a message which was in flight to
+ * a destroyed endpoint is not handed to the next owner of its slot. */
+static uct_xrc_verbs_ep_t *
+uct_xrc_verbs_iface_lookup_token(uct_xrc_verbs_iface_t *iface, uint32_t token)
+{
+    unsigned idx = token & UCT_XRC_VERBS_EP_TOKEN_IDX_MASK;
+    uct_xrc_verbs_ep_t *ep;
+
+    if (idx == 0) {
+        return NULL;
+    }
+
+    if (!ucs_ptr_array_lookup(&iface->ep_table, idx - 1, ep)) {
+        return NULL;
+    }
+
+    return (ep->ep_token == token) ? ep : NULL;
+}
+
 /* Report what the interface ended up using, which is the measurement of the QP
  * model: with SHARED_INI=y the initiator QPs are the remote processes, and
  * every endpoint to one of them is a reference on the QP of that process. */
@@ -1006,6 +1165,16 @@ static void uct_xrc_verbs_iface_log_qp_usage(uct_xrc_verbs_iface_t *iface)
              self->eps_shared_peak,
              self->ep_shared, self->ep_priv_cfg, self->ep_priv_addr,
              self->ep_priv_unpack, self->ep_priv_mask, self->ep_priv_noproc);
+    ucs_info("%s: iface %p QP model v2: ini_scope %s shared_tgt %d tgt_pd %d: "
+             "%u target QPs created, %u alive, %u of them shared (most lanes "
+             "on one: %u), %u initiator QPs alive, %u endpoints peak, %u "
+             "connect conflicts, %u FC messages naming no endpoint",
+             uct_ib_device_name(uct_ib_iface_device(&self->super.super)), self,
+             uct_xrc_verbs_ini_scope_names[self->config.ini_scope],
+             self->config.shared_tgt, self->config.tgt_pd, self->num_tgt_qps,
+             self->tgt_alive, self->tgt_shared_created, self->tgt_refs_peak,
+             self->nqp_alive, self->eps_peak, self->tgt_conflicts,
+             self->fc_no_ep);
 }
 
 static void uct_xrc_verbs_node_qp_cleanup_all(uct_xrc_verbs_iface_t *iface)
@@ -1087,7 +1256,23 @@ static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
     self->config.tgt_state   = config->tgt_state;
     self->config.tgt_fallback = config->tgt_fallback;
     self->config.shared_ini   = config->shared_ini;
+    self->config.ini_scope    = config->ini_scope;
+    self->config.tgt_pd       = config->tgt_pd;
+    /* A target QP can only be shared by lanes whose peers send through one
+     * initiator, which needs the peer to share initiators. The target QP is
+     * keyed on the peer process under either scope: under node scope the peer
+     * process still sends to all of this node through one initiator, unless
+     * that queue fills and is split, which the connect conflict count shows. */
+    self->config.shared_tgt   = config->shared_tgt && config->shared_ini;
     ucs_list_head_init(&self->node_qps);
+    ucs_list_head_init(&self->tgts);
+    ucs_ptr_array_init(&self->ep_table, "xrc_verbs_eps");
+    self->ep_token_gen        = 0;
+    self->tgt_alive           = 0;
+    self->tgt_shared_created  = 0;
+    self->tgt_refs_peak       = 0;
+    self->tgt_conflicts       = 0;
+    self->fc_no_ep            = 0;
     self->last_tx_nqp         = NULL;
     self->num_tgt_qps         = 0;
     self->nqp_shared_created  = 0;
@@ -1202,7 +1387,9 @@ static UCS_CLASS_CLEANUP_FUNC(uct_xrc_verbs_iface_t)
 
     uct_xrc_verbs_iface_log_qp_usage(self);
     uct_xrc_verbs_node_qp_cleanup_all(self);
+    uct_xrc_verbs_tgt_cleanup_all(self);
     uct_rc_iface_cleanup_qps(&self->super);
+    ucs_ptr_array_cleanup(&self->ep_table, 0);
 
     if (self->fc_desc != NULL) {
         ucs_mpool_put(self->fc_desc);
@@ -1358,28 +1545,6 @@ void uct_xrc_verbs_srqn_fc_put(uct_xrc_verbs_srqn_fc_t *srqn_fc)
     ucs_free(srqn_fc);
 }
 
-/* Resolve the target QP named in the immediate data to an endpoint of this
- * interface. The number is checked against the table rather than indexed
- * blindly: a chunk of it is only allocated for numbers this process created. */
-static uct_xrc_verbs_ep_t *
-uct_xrc_verbs_iface_lookup_tgt(uct_rc_iface_t *rc_iface, uint32_t qpn)
-{
-    uct_rc_ep_t **chunk;
-    uct_rc_ep_t *rc_ep;
-
-    if ((qpn == 0) || (qpn >= UCS_BIT(UCT_IB_QPN_ORDER))) {
-        return NULL;
-    }
-
-    chunk = rc_iface->eps[qpn >> UCT_RC_QP_TABLE_ORDER];
-    if (chunk == NULL) {
-        return NULL;
-    }
-
-    rc_ep = chunk[qpn & UCS_MASK(UCT_RC_QP_TABLE_MEMB_ORDER)];
-    return (rc_ep == NULL) ? NULL : ucs_derived_of(rc_ep, uct_xrc_verbs_ep_t);
-}
-
 /* Answer a credit request of the peer paired with @a self by a pure grant,
  * queued at the head of its pending queue if it cannot be sent now. */
 static ucs_status_t
@@ -1414,22 +1579,30 @@ uct_xrc_verbs_iface_fc_handler(uct_rc_iface_t *rc_iface, unsigned qp_num,
                               uct_rc_hdr_t *hdr, unsigned length,
                               uint32_t imm_data, uint16_t lid, unsigned flags)
 {
-    uint8_t fc_hdr   = uct_rc_fc_get_fc_hdr(hdr->am_id);
-    uint32_t tgt_qpn = ntohl(imm_data);
+    uct_xrc_verbs_iface_t *iface = ucs_derived_of(rc_iface,
+                                                  uct_xrc_verbs_iface_t);
+    uint8_t fc_hdr               = uct_rc_fc_get_fc_hdr(hdr->am_id);
+    uint32_t token               = ntohl(imm_data);
     uct_xrc_verbs_ep_t *self, *other;
     uct_xrc_verbs_srqn_fc_t *sf;
+    uct_rc_pending_req_t *fc_req;
     ucs_status_t status;
     unsigned granted = 0;
+    int16_t cur_wnd;
 
     /* wc.qp_num names whichever target QP the sender's shared initiator is
-     * connected to, which may belong to another process of this node. The
-     * sender names the endpoint paired with it in the immediate data. */
-    self = uct_xrc_verbs_iface_lookup_tgt(rc_iface, tgt_qpn);
+     * connected to, which is shared by every lane of the sender, and may
+     * belong to another process of this node. The sender names the endpoint
+     * paired with it by the token that endpoint published. */
+    self = uct_xrc_verbs_iface_lookup_token(iface, token);
+    if (ucs_unlikely(self == NULL)) {
+        ++iface->fc_no_ep;
+    }
 
-    ucs_trace("%s: iface %p flow control message on wc qp 0x%x, paired target "
-              "0x%x -> ep %p, hdr 0x%x",
-              uct_ib_device_name(uct_ib_iface_device(&rc_iface->super.super)),
-              rc_iface, qp_num, tgt_qpn, self, fc_hdr);
+    ucs_trace("%s: iface %p flow control message on wc qp 0x%x, token 0x%x "
+              "-> ep %p, hdr 0x%x",
+              uct_ib_device_name(uct_ib_iface_device(&rc_iface->super)),
+              rc_iface, qp_num, token, self, fc_hdr);
 
     if ((self != NULL) &&
         (self->super.flags & (UCT_RC_EP_FLAG_FLUSH_CANCEL |
@@ -1469,9 +1642,58 @@ uct_xrc_verbs_iface_fc_handler(uct_rc_iface_t *rc_iface, unsigned qp_num,
         }
     }
 
-    /* Soft/hard requests, the grant of this lane and the payload. */
-    status = uct_rc_iface_fc_handler(rc_iface, tgt_qpn, hdr, length, imm_data,
-                                     lid, flags);
+    /* Soft/hard requests, the grant of this lane and the payload: what
+     * uct_rc_iface_fc_handler() does, for the endpoint the token named rather
+     * than the one the QP number table holds, since a target QP is shared. */
+    status = UCS_OK;
+    if (fc_hdr & UCT_RC_EP_FLAG_FC_GRANT) {
+        UCS_STATS_UPDATE_COUNTER(self->super.fc.stats,
+                                 UCT_RC_FC_STAT_RX_GRANT, 1);
+        cur_wnd = self->super.fc.fc_wnd;
+        uct_rc_fc_restore_wnd(rc_iface, &self->super.fc);
+        if (cur_wnd <= 0) {
+            ucs_arbiter_group_schedule(&rc_iface->tx.arbiter,
+                                       &self->super.arb_group);
+            uct_rc_iface_arbiter_dispatch(rc_iface);
+        }
+        if (fc_hdr == UCT_RC_EP_FC_PURE_GRANT) {
+            UCS_STATS_UPDATE_COUNTER(self->super.fc.stats,
+                                     UCT_RC_FC_STAT_RX_PURE_GRANT, 1);
+            goto out_dispatch;
+        }
+    }
+
+    if (fc_hdr & UCT_RC_EP_FLAG_FC_SOFT_REQ) {
+        UCS_STATS_UPDATE_COUNTER(self->super.fc.stats,
+                                 UCT_RC_FC_STAT_RX_SOFT_REQ, 1);
+        self->super.flags |= UCT_RC_EP_FLAG_FC_GRANT;
+    } else if (fc_hdr & UCT_RC_EP_FLAG_FC_HARD_REQ) {
+        UCS_STATS_UPDATE_COUNTER(self->super.fc.stats,
+                                 UCT_RC_FC_STAT_RX_HARD_REQ, 1);
+        fc_req = ucs_mpool_get(&rc_iface->tx.pending_mp);
+        if (ucs_unlikely(fc_req == NULL)) {
+            ucs_error("fc_ep=%p: failed to allocate FC request", self);
+            return UCS_ERR_NO_MEMORY;
+        }
+        fc_req->ep         = &self->super.super.super;
+        fc_req->super.func = uct_rc_ep_fc_grant;
+        status             = uct_rc_ep_fc_grant(&fc_req->super);
+        if (status == UCS_ERR_NO_RESOURCE) {
+            uct_pending_req_arb_group_push_head(&self->super.arb_group,
+                                                &fc_req->super);
+            ucs_arbiter_group_schedule(&rc_iface->tx.arbiter,
+                                       &self->super.arb_group);
+        } else if (status != UCS_OK) {
+            ucs_diag("fc_ep=%p: failed to send FC grant msg: %s", self,
+                     ucs_status_string(status));
+        }
+    }
+
+    status = uct_iface_invoke_am(&rc_iface->super.super,
+                                 hdr->am_id & ~UCT_RC_EP_FC_MASK, hdr + 1,
+                                 length, flags);
+
+out_dispatch:
 
     if (granted > 0) {
         ucs_list_for_each(other, &self->nqp->eps_alive, nqp_link) {

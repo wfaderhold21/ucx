@@ -9,6 +9,7 @@
 
 #include <uct/ib/rc/base/rc_iface.h>
 #include <uct/ib/rc/base/rc_ep.h>
+#include <ucs/datastruct/ptr_array.h>
 #include <ucs/type/class.h>
 
 
@@ -23,6 +24,7 @@
 typedef struct uct_xrc_verbs_iface        uct_xrc_verbs_iface_t;
 typedef struct uct_xrc_verbs_node_qp      uct_xrc_verbs_node_qp_t;
 typedef struct uct_xrc_verbs_srqn_fc      uct_xrc_verbs_srqn_fc_t;
+typedef struct uct_xrc_verbs_tgt          uct_xrc_verbs_tgt_t;
 typedef struct uct_xrc_verbs_ep           uct_xrc_verbs_ep_t;
 
 
@@ -64,6 +66,31 @@ static const char *uct_xrc_verbs_tgt_state_names[] = {
 
 
 /**
+ * What one shared initiator QP serves.
+ */
+typedef enum {
+    UCT_XRC_VERBS_INI_SCOPE_PROCESS, /* the lanes to one remote process     */
+    UCT_XRC_VERBS_INI_SCOPE_NODE,    /* the lanes to every process of a node */
+    UCT_XRC_VERBS_INI_SCOPE_LAST
+} uct_xrc_verbs_ini_scope_t;
+
+
+static const char *uct_xrc_verbs_ini_scope_names[] = {
+    [UCT_XRC_VERBS_INI_SCOPE_PROCESS] = "process",
+    [UCT_XRC_VERBS_INI_SCOPE_NODE]    = "node",
+    [UCT_XRC_VERBS_INI_SCOPE_LAST]    = NULL
+};
+
+
+/* An endpoint token names an endpoint of the interface which issued it: the
+ * slot of the endpoint in the interface table plus one in the low bits, and a
+ * generation in the high bits, so that a late message for a destroyed endpoint
+ * does not resolve to the endpoint which reuses its slot. Zero is no token. */
+#define UCT_XRC_VERBS_EP_TOKEN_IDX_BITS 20
+#define UCT_XRC_VERBS_EP_TOKEN_IDX_MASK UCS_MASK(UCT_XRC_VERBS_EP_TOKEN_IDX_BITS)
+
+
+/**
  * XRC endpoint address.
  *
  * An XRC connection is asymmetric: the active side sends through an XRC
@@ -78,6 +105,7 @@ typedef struct uct_xrc_verbs_ep_addr {
     uct_ib_uint24_t  tgt_qp_num; /* XRC target QP which receives our sends  */
     uct_ib_uint24_t  ini_qp_num; /* XRC initiator QP which sends to us      */
     uint32_t         srqn;       /* SRQ the remote target QP delivers to    */
+    uint32_t         ep_token;   /* names this endpoint in the imm. data    */
 } UCS_S_PACKED uct_xrc_verbs_ep_addr_t;
 
 
@@ -190,6 +218,34 @@ typedef struct uct_xrc_verbs_node_qp {
 
 
 /**
+ * XRC target QP.
+ *
+ * A target QP is connected to exactly one remote initiator QP. With a shared
+ * initiator, every lane of the peer process which sends to us goes through the
+ * same initiator QP, and that QP is connected to the first target QP it learns
+ * of: one target per lane leaves all but one of them idle forever. So the
+ * lanes of this process which pair with one peer process share one target QP,
+ * keyed exactly as the peer keys its initiator, and every lane publishes the
+ * same target QP number. The receiving endpoint is not named by the target QP
+ * but by the endpoint token carried in the immediate data.
+ *
+ * A shared target QP is kept until the interface is closed, as the shared
+ * initiator QP is, because the initiator of the peer stays connected to it.
+ */
+struct uct_xrc_verbs_tgt {
+    ucs_list_link_t           list;         /* entry in iface->tgts           */
+    struct ibv_qp            *qp;
+    uct_xrc_verbs_node_key_t  key;          /* peer process it receives from  */
+    int                       shared;
+    int                       inited;       /* reached INIT                   */
+    int                       connected;    /* reached RTR                    */
+    uint32_t                  dest_ini_qpn; /* remote initiator it serves     */
+    unsigned                  refcount;
+    unsigned                  max_refs;
+};
+
+
+/**
  * XRC verbs endpoint.
  */
 typedef struct uct_xrc_verbs_ep {
@@ -198,9 +254,12 @@ typedef struct uct_xrc_verbs_ep {
     uct_ib_fence_info_t    fi;
     uct_xrc_verbs_node_qp_t *nqp;       /* shared initiator QP of the node    */
     struct ibv_qp         *ini_qp;      /* = nqp->qp, outbound operations     */
-    struct ibv_qp         *tgt_qp;      /* XRC_RECV: inbound operations       */
+    uct_xrc_verbs_tgt_t   *tgt;         /* target QP, shared or private       */
+    struct ibv_qp         *tgt_qp;      /* = tgt->qp, inbound operations      */
     uint32_t               remote_srqn; /* destination SRQ number             */
     uint32_t               remote_tgt_qpn; /* target QP of the paired peer ep */
+    uint32_t               ep_token;    /* names this endpoint to its peer    */
+    uint32_t               remote_ep_token; /* names the paired peer endpoint */
     ucs_list_link_t        nqp_link;     /* on the initiator QP's endpoint list */
     uct_xrc_verbs_srqn_fc_t *srqn_fc;    /* window of the destination SRQ       */
     uint8_t                conn_flags;  /* UCT_XRC_VERBS_EP_FLAG_xx           */
@@ -226,6 +285,9 @@ typedef struct uct_xrc_verbs_iface_config {
     char                               *domain_dir;
     int                                domain_shared;
     int                                shared_ini;
+    int                                shared_tgt;
+    int                                tgt_pd;
+    uct_xrc_verbs_ini_scope_t          ini_scope;
 } uct_xrc_verbs_iface_config_t;
 
 
@@ -250,6 +312,8 @@ typedef struct uct_xrc_verbs_iface_config {
  * initiators of their own, which is correct and merely more expensive. */
 #define UCT_XRC_VERBS_IFACE_ADDR_SRQN_OFF    24
 #define UCT_XRC_VERBS_IFACE_ADDR_SRQN_ABSENT UINT32_MAX
+/* The srqn of an initiator key which serves every process of a node. */
+#define UCT_XRC_VERBS_KEY_ANY_PROCESS        (UINT32_MAX - 1)
 
 typedef struct {
     /* uct_ib_address_t is a variable-length placeholder type, so the bytes are
@@ -290,6 +354,14 @@ typedef struct uct_xrc_verbs_iface {
     unsigned                    ep_priv_mask; /* peer address not passed at all*/
     unsigned                    ep_priv_unpack;/* eps whose address was opaque */
     unsigned                    ep_priv_noproc; /* no process in the address    */
+    ucs_list_link_t             tgts;         /* target QPs                    */
+    ucs_ptr_array_t             ep_table;     /* endpoints by token slot       */
+    uint32_t                    ep_token_gen; /* generation of the next token  */
+    unsigned                    tgt_alive;          /* target QPs alive now    */
+    unsigned                    tgt_shared_created; /* shared target QPs made  */
+    unsigned                    tgt_refs_peak;      /* lanes on one of them    */
+    unsigned                    tgt_conflicts;      /* peer used 2 initiators  */
+    unsigned                    fc_no_ep;           /* FC naming no endpoint   */
     struct ibv_send_wr          inl_am_wr;
     struct ibv_send_wr          inl_rwrite_wr;
     struct ibv_sge              inl_sge[UCT_IB_MAX_IOV];
@@ -305,6 +377,9 @@ typedef struct uct_xrc_verbs_iface {
         unsigned                tgt_fallback;
         int                     domain_shared;
         int                     shared_ini;
+        int                     shared_tgt;
+        int                     tgt_pd;
+        uct_xrc_verbs_ini_scope_t ini_scope;
     } config;
 } uct_xrc_verbs_iface_t;
 
@@ -361,6 +436,26 @@ unsigned uct_xrc_verbs_iface_poll_tx_wqes(uct_xrc_verbs_iface_t *iface);
 ucs_status_t
 uct_xrc_verbs_iface_create_tgt_qp(uct_xrc_verbs_iface_t *iface,
                                   struct ibv_qp **qp_p);
+
+/* Look up the target QP which receives from the peer process @a key names,
+ * create it if this is the first lane paired with that process, and take a
+ * reference. A NULL @a key gives the endpoint a target QP of its own. */
+ucs_status_t
+uct_xrc_verbs_iface_get_tgt(uct_xrc_verbs_iface_t *iface,
+                            const uct_xrc_verbs_node_key_t *key,
+                            uct_xrc_verbs_tgt_t **tgt_p);
+
+/* Drop a reference to a target QP. A private one is destroyed with its last
+ * user, a shared one is kept until the interface is closed. */
+void uct_xrc_verbs_tgt_release(uct_xrc_verbs_iface_t *iface,
+                               uct_xrc_verbs_tgt_t *tgt);
+
+/* Issue the token which names @a ep to its peer, 0 on failure. */
+uint32_t uct_xrc_verbs_iface_ep_token_alloc(uct_xrc_verbs_iface_t *iface,
+                                            uct_xrc_verbs_ep_t *ep);
+
+void uct_xrc_verbs_iface_ep_token_free(uct_xrc_verbs_iface_t *iface,
+                                       uint32_t token);
 
 ucs_status_t uct_xrc_verbs_iface_prepost_recvs(uct_xrc_verbs_iface_t *iface);
 

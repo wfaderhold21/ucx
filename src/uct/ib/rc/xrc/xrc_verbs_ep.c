@@ -76,15 +76,15 @@ uct_xrc_verbs_ep_post_send(uct_xrc_verbs_iface_t *iface, uct_xrc_verbs_ep_t *ep,
                          (wr->opcode == IBV_WR_SEND) ? uct_rc_ep_packet_dump :
                                                        NULL);
 
-    /* A shared initiator QP is connected to the target QP of one endpoint of
-     * the peer node only, so a receive completion names that target QP
-     * whichever process the message is delivered to, and cannot tell the
+    /* A shared initiator QP is connected to one target QP of the peer, which
+     * all the lanes of the peer share, so a receive completion names that
+     * target QP whichever lane the message is for, and cannot tell the
      * receiver which of its endpoints it belongs to. Name it in the
-     * immediate data: the target QP of the peer endpoint paired with this
-     * one, which is unique on the receiving device and registered there. */
+     * immediate data: the token the peer endpoint paired with this one
+     * published in its address. */
     if (wr->opcode == IBV_WR_SEND) {
         wr->opcode   = IBV_WR_SEND_WITH_IMM;
-        wr->imm_data = htonl(ep->remote_tgt_qpn);
+        wr->imm_data = htonl(ep->remote_ep_token);
         ret          = ibv_post_send(ep->ini_qp, wr, &bad_wr);
         wr->opcode   = IBV_WR_SEND;
     } else {
@@ -793,6 +793,7 @@ ucs_status_t uct_xrc_verbs_ep_get_address(uct_ep_h tl_ep, uct_ep_addr_t *addr)
     uct_ib_pack_uint24(xrc_addr->super.tgt_qp_num, ep->tgt_qp->qp_num);
     uct_ib_pack_uint24(xrc_addr->super.ini_qp_num, ep->ini_qp->qp_num);
     xrc_addr->super.srqn  = htonl(iface->srq_num);
+    xrc_addr->super.ep_token = htonl(ep->ep_token);
 
     if (uct_ib_md_is_flush_rkey_valid(md->flush_rkey)) {
         xrc_addr->super.flags |= UCT_XRC_VERBS_ADDR_HAS_ATOMIC_MR;
@@ -840,9 +841,26 @@ uct_xrc_verbs_ep_tgt_connect(uct_xrc_verbs_iface_t *iface,
                              enum ibv_mtu path_mtu)
 {
     uct_rc_iface_t *rc_iface = &iface->super;
-    ucs_status_t status;
+    uct_xrc_verbs_tgt_t *tgt = ep->tgt;
     struct ibv_qp_attr qp_attr;
     int ret;
+
+    if (tgt->connected) {
+        /* Shared with the other lanes paired with this peer process, and
+         * brought up by the first of them. Every lane of the peer sends
+         * through the one initiator its process keeps for us, so they all
+         * name the same one. */
+        if (tgt->dest_ini_qpn == dest_qp_num) {
+            return UCS_OK;
+        }
+
+        ++iface->tgt_conflicts;
+        ucs_error("xrc ep %p: target QP 0x%x serves initiator 0x%x of the "
+                  "peer, which now names initiator 0x%x (%u lanes share it)",
+                  ep, tgt->qp->qp_num, tgt->dest_ini_qpn, dest_qp_num,
+                  tgt->refcount);
+        return UCS_ERR_UNREACHABLE;
+    }
 
     memset(&qp_attr, 0, sizeof(qp_attr));
     qp_attr.qp_state           = IBV_QPS_RTR;
@@ -863,6 +881,9 @@ uct_xrc_verbs_ep_tgt_connect(uct_xrc_verbs_iface_t *iface,
                   ep->tgt_qp->qp_num);
         return UCS_ERR_IO_ERROR;
     }
+
+    tgt->connected    = 1;
+    tgt->dest_ini_qpn = dest_qp_num;
 
     if ((iface->config.tgt_state == UCT_XRC_VERBS_TGT_STATE_RTR) ||
         !iface->config.tgt_fallback) {
@@ -948,7 +969,9 @@ uct_xrc_verbs_ep_connect_to_ep_v2(uct_ep_h tl_ep,
      * endpoint have to name the same process, or the endpoint would send into
      * a queue whose connected target belongs to another one. Both come from
      * the address of the peer, so they can only disagree if it was misread. */
-    if (ep->nqp->shared && (ntohl(xrc_addr->super.srqn) != ep->nqp->key.srqn)) {
+    if (ep->nqp->shared &&
+        (ep->nqp->key.srqn != UCT_XRC_VERBS_KEY_ANY_PROCESS) &&
+        (ntohl(xrc_addr->super.srqn) != ep->nqp->key.srqn)) {
         ucs_error("ep %p: the peer delivers to srqn 0x%x, but its address was "
                   "keyed on 0x%x", ep, ntohl(xrc_addr->super.srqn),
                   ep->nqp->key.srqn);
@@ -957,37 +980,31 @@ uct_xrc_verbs_ep_connect_to_ep_v2(uct_ep_h tl_ep,
 
     if (!(ep->conn_flags & UCT_XRC_VERBS_EP_FLAG_INI_CONNECTED)) {
         /* Outbound operations: connect the initiator to the remote target. The
-         * initiator is shared between the endpoints to one node, and which of
+         * initiator is shared between the endpoints to one peer, and which of
          * their targets it is connected to does not matter, because a request
          * names the destination shared receive queue itself: the first
-         * endpoint to connect brings the QP up for all of them. */
-        if (ep->nqp->connected) {
-            ep->remote_srqn    = ntohl(xrc_addr->super.srqn);
-            ep->remote_tgt_qpn = tgt_qp_num;
-            /* The peer of this endpoint is known now, so it can join the list
-             * its initiator QP keeps of the endpoints which send through it,
-             * and take the flow control window its destination SRQ shares. */
-            if ((ep->nqp != NULL) && ucs_list_is_empty(&ep->nqp_link)) {
-                ucs_list_add_tail(&ep->nqp->eps_alive, &ep->nqp_link);
+         * endpoint to connect brings the QP up for all of them. The others
+         * only join it, and still go on to connect their target QP and take
+         * the memory keys of the peer below; returning early here used to
+         * leave the atomic offset and the flush key of every lane but the
+         * first one unset. */
+        if (!ep->nqp->connected) {
+            status = uct_rc_iface_qp_connect(&iface->super, ep->ini_qp,
+                                             tgt_qp_num, &ah_attr, path_mtu);
+            if (status != UCS_OK) {
+                return status;
             }
-            ep->srqn_fc = uct_xrc_verbs_srqn_fc_get(ep->nqp, ep->remote_srqn);
-            if (ep->srqn_fc == NULL) {
-                return UCS_ERR_NO_MEMORY;
-            }
-            ep->conn_flags |= UCT_XRC_VERBS_EP_FLAG_INI_CONNECTED;
-            return uct_xrc_verbs_ep_tgt_connect(iface, ep, ini_qp_num,
-                                               &ah_attr, path_mtu);
+
+            ep->nqp->connected = 1;
         }
 
-        status = uct_rc_iface_qp_connect(&iface->super, ep->ini_qp, tgt_qp_num,
-                                        &ah_attr, path_mtu);
-        if (status != UCS_OK) {
-            return status;
-        }
-
-        ep->remote_srqn    = ntohl(xrc_addr->super.srqn);
-        ep->remote_tgt_qpn = tgt_qp_num;
-        if ((ep->nqp != NULL) && ucs_list_is_empty(&ep->nqp_link)) {
+        ep->remote_srqn     = ntohl(xrc_addr->super.srqn);
+        ep->remote_tgt_qpn  = tgt_qp_num;
+        ep->remote_ep_token = ntohl(xrc_addr->super.ep_token);
+        /* The peer of this endpoint is known now, so it can join the list its
+         * initiator QP keeps of the endpoints which send through it, and take
+         * the flow control window its destination SRQ shares. */
+        if (ucs_list_is_empty(&ep->nqp_link)) {
             ucs_list_add_tail(&ep->nqp->eps_alive, &ep->nqp_link);
         }
         ep->srqn_fc = uct_xrc_verbs_srqn_fc_get(ep->nqp, ep->remote_srqn);
@@ -995,7 +1012,6 @@ uct_xrc_verbs_ep_connect_to_ep_v2(uct_ep_h tl_ep,
             return UCS_ERR_NO_MEMORY;
         }
         ep->conn_flags |= UCT_XRC_VERBS_EP_FLAG_INI_CONNECTED;
-        ep->nqp->connected = 1;
     }
 
     if (!(ep->conn_flags & UCT_XRC_VERBS_EP_FLAG_TGT_CONNECTED)) {
@@ -1057,6 +1073,7 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
     uct_xrc_verbs_iface_t *iface = ucs_derived_of(params->iface,
                                                   uct_xrc_verbs_iface_t);
     uct_xrc_verbs_node_key_t key, *key_p = NULL;
+    uct_xrc_verbs_node_key_t tgt_key, *tgt_key_p = NULL;
     const uct_xrc_verbs_iface_addr_t *peer_addr;
     const uct_ib_address_t *ib_addr;
     uint32_t srqn_be;
@@ -1130,6 +1147,17 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
                     key.srqn = ntohl(srqn_be);
                 }
 
+                if ((key.srqn != UCT_XRC_VERBS_IFACE_ADDR_SRQN_ABSENT) &&
+                    (iface->config.ini_scope ==
+                     UCT_XRC_VERBS_INI_SCOPE_NODE)) {
+                    /* Experimental: one initiator for the whole node. The
+                     * process is still known, and the target QP of a lane
+                     * is keyed on it below. */
+                    tgt_key      = key;
+                    tgt_key_p    = &tgt_key;
+                    key.srqn     = UCT_XRC_VERBS_KEY_ANY_PROCESS;
+                }
+
                 if (key.srqn == UCT_XRC_VERBS_IFACE_ADDR_SRQN_ABSENT) {
                     /* An address which names no process cannot be shared: the
                      * queue would be given to two processes at once. */
@@ -1158,10 +1186,23 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
 
     self->ini_qp = self->nqp->qp;
 
-    status = uct_xrc_verbs_iface_create_tgt_qp(iface, &self->tgt_qp);
+    /* The lanes paired with one peer process share the target QP the
+     * initiator of that process will be connected to. The key is the one the
+     * initiator is shared on, so the two are shared at the same granularity;
+     * under node scope it is still the peer process (tgt_key), because that
+     * is what one initiator of the peer serves towards this process. */
+    if (!iface->config.shared_tgt) {
+        tgt_key_p = NULL;
+    } else if (tgt_key_p == NULL) {
+        tgt_key_p = key_p;
+    }
+
+    status = uct_xrc_verbs_iface_get_tgt(iface, tgt_key_p, &self->tgt);
     if (status != UCS_OK) {
         goto err_release_nqp;
     }
+
+    self->tgt_qp = self->tgt->qp;
 
     UCS_CLASS_CALL_SUPER_INIT(uct_rc_ep_t, &iface->super,
                               self->nqp->qpn, params);
@@ -1177,21 +1218,27 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
         self->nqp->inited = 1;
     }
 
-    status = uct_xrc_verbs_qp_to_init(self->tgt_qp, iface,
-                                      IBV_ACCESS_REMOTE_WRITE  |
-                                      IBV_ACCESS_REMOTE_READ   |
-                                      IBV_ACCESS_REMOTE_ATOMIC);
-    if (status != UCS_OK) {
-        goto err_destroy_tgt;
+    if (!self->tgt->inited) {
+        status = uct_xrc_verbs_qp_to_init(self->tgt_qp, iface,
+                                          IBV_ACCESS_REMOTE_WRITE  |
+                                          IBV_ACCESS_REMOTE_READ   |
+                                          IBV_ACCESS_REMOTE_ATOMIC);
+        if (status != UCS_OK) {
+            goto err_destroy_tgt;
+        }
+
+        self->tgt->inited = 1;
     }
 
-    /* Receive completions name the target QP, so it has to resolve to this
-     * endpoint (for flow control in particular). The initiator QP is not
-     * registered: it is shared, and its completions are attributed to the
-     * endpoint by the position which its operation has in its send queue. */
-    status = uct_rc_iface_add_qp(&iface->super, &self->super,
-                                 self->tgt_qp->qp_num);
-    if (status != UCS_OK) {
+    /* Receive completions name a target QP which the lanes of a peer share,
+     * so the endpoint is named by a token instead, which the peer carries in
+     * the immediate data of each send. Neither QP is put in the QP number
+     * table: the initiator is shared, and its completions are attributed to
+     * the endpoint by the position its operation has in its send queue. */
+    self->ep_token = uct_xrc_verbs_iface_ep_token_alloc(iface, self);
+    if (self->ep_token == 0) {
+        ucs_error("xrc iface %p: out of endpoint tokens", iface);
+        status = UCS_ERR_EXCEEDS_LIMIT;
         goto err_destroy_tgt;
     }
 
@@ -1200,17 +1247,21 @@ UCS_CLASS_INIT_FUNC(uct_xrc_verbs_ep_t, const uct_ep_params_t *params)
     uct_ib_fence_info_init(&self->fi);
     self->remote_srqn = 0;
     self->remote_tgt_qpn = 0;
+    self->remote_ep_token = 0;
+    self->super.atomic_mr_offset = 0;
+    self->super.flush_rkey       = UCT_IB_MD_INVALID_FLUSH_RKEY;
     self->srqn_fc     = NULL;
     ucs_list_head_init(&self->nqp_link);
     self->conn_flags  = 0;
 
-    ucs_debug("created xrc ep %p ini_qp 0x%x tgt_qp 0x%x shared %d", self,
-              self->nqp->qpn, self->tgt_qp->qp_num, key_p != NULL);
+    ucs_debug("created xrc ep %p ini_qp 0x%x tgt_qp 0x%x shared ini %d tgt %d "
+              "token 0x%x", self, self->nqp->qpn, self->tgt_qp->qp_num,
+              key_p != NULL, self->tgt->shared, self->ep_token);
 
     return UCS_OK;
 
 err_destroy_tgt:
-    uct_ib_destroy_qp(self->tgt_qp);
+    uct_xrc_verbs_tgt_release(iface, self->tgt);
 err_release_nqp:
     uct_xrc_verbs_node_qp_release(self->nqp);
 err:
@@ -1225,13 +1276,13 @@ UCS_CLASS_CLEANUP_FUNC(uct_xrc_verbs_ep_t)
 
     uct_rc_txqp_purge_outstanding(&iface->super, &self->super.txqp,
                                   UCS_ERR_CANCELED, self->txcnt.pi, 1);
-    uct_ib_modify_qp(self->tgt_qp, IBV_QPS_ERR);
 
-    /* The target QP has no send queue and its receive queue is the interface
-     * SRQ, so it owns no completion queue entries and can be released right
-     * away. */
-    uct_rc_iface_remove_qp(&iface->super, self->tgt_qp->qp_num);
-    uct_ib_destroy_qp(self->tgt_qp);
+    /* A message still in flight to this endpoint must not resolve to it, nor
+     * to the next owner of its slot: the token goes, and the generation
+     * makes a late one miss. The target QP is released; a private one goes
+     * with this endpoint, a shared one stays with the interface. */
+    uct_xrc_verbs_iface_ep_token_free(iface, self->ep_token);
+    uct_xrc_verbs_tgt_release(iface, self->tgt);
 
     /* The send queue of the shared initiator QP still refers to this endpoint
      * by the operations it has in flight, so take their completions off the
