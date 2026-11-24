@@ -289,6 +289,7 @@ typedef struct uct_xrc_verbs_iface_config {
     int                                tgt_pd;
     unsigned long                      node_qp_eps;
     uct_xrc_verbs_ini_scope_t          ini_scope;
+    ucs_ternary_auto_value_t           ddp_enable;
 } uct_xrc_verbs_iface_config_t;
 
 
@@ -382,6 +383,7 @@ typedef struct uct_xrc_verbs_iface {
         int                     tgt_pd;
         unsigned                node_qp_eps;
         uct_xrc_verbs_ini_scope_t ini_scope;
+        int                     ddp;      /* QPs are created with OOO_DP */
     } config;
 } uct_xrc_verbs_iface_t;
 

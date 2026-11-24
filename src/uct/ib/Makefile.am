@@ -54,6 +54,11 @@ libuct_ib_la_SOURCES += \
 	rc/xrc/xrc_verbs_ep.c \
 	rc/xrc/xrc_verbs_iface.c
 
+if HAVE_MLX5_DV
+# Out-of-order data placement on XRC QPs is requested through mlx5dv.
+libuct_ib_la_LDFLAGS += $(LIB_MLX5)
+endif # HAVE_MLX5_DV
+
 endif # HAVE_TL_XRC
 
 if HAVE_TL_UD

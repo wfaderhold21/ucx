@@ -23,6 +23,14 @@
 #include <ucs/sys/string.h>
 #include <ucs/sys/sys.h>
 
+#if defined(HAVE_MLX5_DV) && HAVE_DECL_MLX5DV_CREATE_QP && \
+    defined(HAVE_OOO_RECV_WRS)
+#  include <infiniband/mlx5dv.h>
+#  define UCT_XRC_VERBS_HAVE_DDP 1
+#else
+#  define UCT_XRC_VERBS_HAVE_DDP 0
+#endif
+
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -135,6 +143,19 @@ static ucs_config_field_t uct_xrc_verbs_iface_config_table[] = {
    "destination SRQ.\n",
    ucs_offsetof(uct_xrc_verbs_iface_config_t, tgt_pd),
    UCS_CONFIG_TYPE_BOOL},
+
+  {"DDP_ENABLE", "try",
+   "Create the XRC initiator and target QPs with out-of-order data placement\n"
+   "(MLX5DV_QP_CREATE_OOO_DP, the same mode as UCX_RC_MLX5_DDP_ENABLE), so that\n"
+   "a fabric which sprays the packets of one QP over several paths does not\n"
+   "turn every reordering into a NAK and a go-back-N retransmission.\n"
+   "Both ends of a connection must use the same setting: an initiator with it\n"
+   "and a target without it, or the reverse, does not complete transfers.\n"
+   " - try: use it when the device supports it for XRC\n"
+   " - y:   require it\n"
+   " - n:   IBTA (in-order) QPs\n",
+   ucs_offsetof(uct_xrc_verbs_iface_config_t, ddp_enable),
+   UCS_CONFIG_TYPE_TERNARY},
 
   {NULL}
 };
@@ -478,6 +499,55 @@ static void uct_xrc_verbs_iface_close_xrcd(uct_xrc_verbs_iface_t *iface)
     }
 }
 
+/* Create an XRC QP, with out-of-order data placement when the interface uses
+ * it. OOO_DP is a create flag of mlx5dv_create_qp(): the kernel records it and
+ * sets dp_ordering in the QP context at INIT->RTR, the same way it does for an
+ * rc_mlx5 QP with DDP. The flag has to be on both the initiator and the target
+ * of a connection; with it on one end only, transfers time out. */
+static struct ibv_qp *
+uct_xrc_verbs_iface_qp_create(uct_xrc_verbs_iface_t *iface,
+                              struct ibv_context *ctx,
+                              struct ibv_qp_init_attr_ex *attr)
+{
+#if UCT_XRC_VERBS_HAVE_DDP
+    struct mlx5dv_qp_init_attr dv_attr;
+
+    if (iface->config.ddp) {
+        memset(&dv_attr, 0, sizeof(dv_attr));
+        dv_attr.comp_mask    = MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS;
+        dv_attr.create_flags = MLX5DV_QP_CREATE_OOO_DP;
+        return mlx5dv_create_qp(ctx, attr, &dv_attr);
+    }
+#endif
+
+    return ibv_create_qp_ex(ctx, attr);
+}
+
+/* Whether the device can place XRC data out of order: the kernel accepts
+ * OOO_DP on an XRC QP when the firmware reports dp_ordering_ooo_all_xrc (and
+ * dp_ordering_force), which rdma-core exposes as ooo_recv_wrs_caps.max_xrc. */
+static int uct_xrc_verbs_iface_ddp_supported(struct ibv_context *ctx)
+{
+#if UCT_XRC_VERBS_HAVE_DDP
+    struct mlx5dv_context dv_ctx;
+
+    if (!mlx5dv_is_supported(ctx->device)) {
+        return 0;
+    }
+
+    memset(&dv_ctx, 0, sizeof(dv_ctx));
+    dv_ctx.comp_mask = MLX5DV_CONTEXT_MASK_OOO_RECV_WRS;
+    if (mlx5dv_query_device(ctx, &dv_ctx) != 0) {
+        return 0;
+    }
+
+    return (dv_ctx.comp_mask & MLX5DV_CONTEXT_MASK_OOO_RECV_WRS) &&
+           (dv_ctx.ooo_recv_wrs_caps.max_xrc > 0);
+#else
+    return 0;
+#endif
+}
+
 ucs_status_t
 uct_xrc_verbs_iface_create_ini_qp(uct_xrc_verbs_iface_t *iface,
                                   unsigned max_send_wr,
@@ -505,7 +575,7 @@ uct_xrc_verbs_iface_create_ini_qp(uct_xrc_verbs_iface_t *iface,
     attr.comp_mask           = IBV_QP_INIT_ATTR_PD;
     attr.pd                  = md->pd;
 
-    qp = ibv_create_qp_ex(dev->ibv_context, &attr);
+    qp = uct_xrc_verbs_iface_qp_create(iface, dev->ibv_context, &attr);
     if (qp == NULL) {
         /* An oversized send queue is rejected rather than clamped, and the
          * caller of a shared initiator QP lowers its request until it is
@@ -549,7 +619,7 @@ uct_xrc_verbs_iface_create_tgt_qp(uct_xrc_verbs_iface_t *iface,
         attr.pd         = md->pd;
     }
 
-    qp = ibv_create_qp_ex(dev->ibv_context, &attr);
+    qp = uct_xrc_verbs_iface_qp_create(iface, dev->ibv_context, &attr);
     if (qp == NULL) {
         /* Some stacks only accept an SRQ-less target QP, in which case the SRQ
          * is selected by the remote SRQ number carried in each work request. */
@@ -560,7 +630,7 @@ uct_xrc_verbs_iface_create_tgt_qp(uct_xrc_verbs_iface_t *iface,
         attr.comp_mask = IBV_QP_INIT_ATTR_XRCD;
         attr.xrcd      = iface->xrcd;
 
-        qp = ibv_create_qp_ex(dev->ibv_context, &attr);
+        qp = uct_xrc_verbs_iface_qp_create(iface, dev->ibv_context, &attr);
         if (qp == NULL) {
             uct_ib_check_memlock_limit_msg(dev->ibv_context,
                                            UCS_LOG_LEVEL_ERROR,
@@ -1180,14 +1250,15 @@ static void uct_xrc_verbs_iface_log_qp_usage(uct_xrc_verbs_iface_t *iface)
              self->eps_shared_peak,
              self->ep_shared, self->ep_priv_cfg, self->ep_priv_addr,
              self->ep_priv_unpack, self->ep_priv_mask, self->ep_priv_noproc);
-    ucs_info("%s: iface %p QP model v2: ini_scope %s shared_tgt %d tgt_pd %d: "
+    ucs_info("%s: iface %p QP model v2: ini_scope %s shared_tgt %d tgt_pd %d ddp %d: "
              "%u target QPs created, %u alive, %u of them shared (most lanes "
              "on one: %u), %u initiator QPs alive, %u endpoints peak, %u "
              "connect conflicts, %u FC messages naming no endpoint, "
              "initiator sized for %u endpoints (most on one: %u, refused %u)",
              uct_ib_device_name(uct_ib_iface_device(&self->super.super)), self,
              uct_xrc_verbs_ini_scope_names[self->config.ini_scope],
-             self->config.shared_tgt, self->config.tgt_pd, self->num_tgt_qps,
+             self->config.shared_tgt, self->config.tgt_pd, self->config.ddp,
+             self->num_tgt_qps,
              self->tgt_alive, self->tgt_shared_created, self->tgt_refs_peak,
              self->nqp_alive, self->eps_peak, self->tgt_conflicts,
              self->fc_no_ep, self->config.node_qp_eps, self->nqp_shared_refs,
@@ -1279,6 +1350,20 @@ static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
                                 (config->ini_scope == UCT_XRC_VERBS_INI_SCOPE_NODE) ?
                                 1024 : UCT_XRC_VERBS_NODE_QP_EPS;
     self->config.tgt_pd       = config->tgt_pd;
+    self->config.ddp          = 0;
+    if (config->ddp_enable != UCS_NO) {
+        self->config.ddp = uct_xrc_verbs_iface_ddp_supported(
+                                   uct_ib_iface_device(&self->super.super)->ibv_context);
+        if (!self->config.ddp && (config->ddp_enable == UCS_YES)) {
+            ucs_error("%s: xrc_verbs DDP_ENABLE=y, but the device does not "
+                      "support out-of-order placement on XRC QPs",
+                      uct_ib_device_name(&ib_md->dev));
+            status = UCS_ERR_UNSUPPORTED;
+            goto err;
+        }
+    }
+    ucs_debug("%s: xrc_verbs ddp %d", uct_ib_device_name(&ib_md->dev),
+              self->config.ddp);
     /* A target QP can only be shared by lanes whose peers send through one
      * initiator, which needs the peer to share initiators. The target QP is
      * keyed on the peer process under either scope: under node scope the peer
