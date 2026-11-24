@@ -111,13 +111,22 @@ static ucs_config_field_t uct_xrc_verbs_iface_config_table[] = {
    "What one shared initiator QP serves:\n"
    " - process : the lanes to one remote process (validated default).\n"
    " - node    : the lanes to every process of a remote node. Experimental:\n"
-   "             correct only if the responder validates the rkey of an RDMA or\n"
-   "             atomic request against the destination SRQ of the request, not\n"
-   "             against the target QP it arrived on. Size TX_MAX_WR so one\n"
-   "             queue can hold all the lanes to a node, or the queue splits\n"
-   "             and shared target QPs report connect conflicts.\n",
+   "             far fewer initiator QPs, but each one carries a whole node's\n"
+   "             burst, which on lossy (no PFC) RoCE turns rare tail-packet\n"
+   "             losses into frequent retransmit-timer stalls for multi-packet\n"
+   "             eager sends. See NODE_QP_EPS for its sizing.\n",
    ucs_offsetof(uct_xrc_verbs_iface_config_t, ini_scope),
    UCS_CONFIG_TYPE_ENUM(uct_xrc_verbs_ini_scope_names)},
+
+  {"NODE_QP_EPS", "auto",
+   "How many endpoints one shared initiator QP is sized for and admits. Its\n"
+   "send queue is TX_MAX_WR times this (lowered until the device grants it),\n"
+   "and it admits endpoints while their outstanding work still fits. \"auto\"\n"
+   "is 64 under INI_SCOPE=process and 1024 under INI_SCOPE=node, where one QP\n"
+   "has to take every lane to every process of a remote node: a second QP to\n"
+   "the same node cannot connect to a target QP the first one already owns.\n",
+   ucs_offsetof(uct_xrc_verbs_iface_config_t, node_qp_eps),
+   UCS_CONFIG_TYPE_ULUNITS},
 
   {"TGT_PD", "y",
    "Create the XRC target QP with the protection domain of this process. With\n"
@@ -761,7 +770,7 @@ uct_xrc_verbs_node_qp_create(uct_xrc_verbs_iface_t *iface,
      * sized for all of them at once. The device does not clamp an oversized
      * request but rejects it, so the request is lowered until it is granted,
      * and the number of endpoints the QP can serve follows from what it got. */
-    max_wr = ucs_max(iface->config.tx_max_wr, 1u) * UCT_XRC_VERBS_NODE_QP_EPS;
+    max_wr = ucs_max(iface->config.tx_max_wr, 1u) * iface->config.node_qp_eps;
     max_wr = ucs_min(max_wr,
                      uct_ib_iface_device(&iface->super.super)->dev_attr
                      .orig_attr.max_qp_wr);
@@ -789,7 +798,13 @@ uct_xrc_verbs_node_qp_create(uct_xrc_verbs_iface_t *iface,
              .max_qp_wr, cap.max_send_wr, iface->config.tx_max_wr,
              cap.max_send_wr / ucs_max(iface->config.tx_max_wr, 1u));
 
-    nqp->max_eps     = ucs_max(cap.max_send_wr / iface->config.tx_max_wr, 1u);
+    /* Under node scope the headcount must not split the lanes to one node
+     * over several QPs, so it is the configured one; the outstanding-work
+     * check at admission and each endpoint's own TX_MAX_WR window keep the
+     * send queue from overfilling. */
+    nqp->max_eps     = (iface->config.ini_scope == UCT_XRC_VERBS_INI_SCOPE_NODE) ?
+                       iface->config.node_qp_eps :
+                       ucs_max(cap.max_send_wr / iface->config.tx_max_wr, 1u);
     /* The depth actually granted, not the one asked for: the two differ when
      * the request had to be lowered, and the number of endpoints this queue
      * can serve is derived from the granted one. */
@@ -1168,13 +1183,15 @@ static void uct_xrc_verbs_iface_log_qp_usage(uct_xrc_verbs_iface_t *iface)
     ucs_info("%s: iface %p QP model v2: ini_scope %s shared_tgt %d tgt_pd %d: "
              "%u target QPs created, %u alive, %u of them shared (most lanes "
              "on one: %u), %u initiator QPs alive, %u endpoints peak, %u "
-             "connect conflicts, %u FC messages naming no endpoint",
+             "connect conflicts, %u FC messages naming no endpoint, "
+             "initiator sized for %u endpoints (most on one: %u, refused %u)",
              uct_ib_device_name(uct_ib_iface_device(&self->super.super)), self,
              uct_xrc_verbs_ini_scope_names[self->config.ini_scope],
              self->config.shared_tgt, self->config.tgt_pd, self->num_tgt_qps,
              self->tgt_alive, self->tgt_shared_created, self->tgt_refs_peak,
              self->nqp_alive, self->eps_peak, self->tgt_conflicts,
-             self->fc_no_ep);
+             self->fc_no_ep, self->config.node_qp_eps, self->nqp_shared_refs,
+             self->nqp_gate_full);
 }
 
 static void uct_xrc_verbs_node_qp_cleanup_all(uct_xrc_verbs_iface_t *iface)
@@ -1257,6 +1274,10 @@ static UCS_CLASS_INIT_FUNC(uct_xrc_verbs_iface_t, uct_md_h tl_md,
     self->config.tgt_fallback = config->tgt_fallback;
     self->config.shared_ini   = config->shared_ini;
     self->config.ini_scope    = config->ini_scope;
+    self->config.node_qp_eps  = (config->node_qp_eps != UCS_ULUNITS_AUTO) ?
+                                ucs_max(config->node_qp_eps, 1ul) :
+                                (config->ini_scope == UCT_XRC_VERBS_INI_SCOPE_NODE) ?
+                                1024 : UCT_XRC_VERBS_NODE_QP_EPS;
     self->config.tgt_pd       = config->tgt_pd;
     /* A target QP can only be shared by lanes whose peers send through one
      * initiator, which needs the peer to share initiators. The target QP is

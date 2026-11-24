@@ -287,6 +287,7 @@ typedef struct uct_xrc_verbs_iface_config {
     int                                shared_ini;
     int                                shared_tgt;
     int                                tgt_pd;
+    unsigned long                      node_qp_eps;
     uct_xrc_verbs_ini_scope_t          ini_scope;
 } uct_xrc_verbs_iface_config_t;
 
@@ -379,6 +380,7 @@ typedef struct uct_xrc_verbs_iface {
         int                     shared_ini;
         int                     shared_tgt;
         int                     tgt_pd;
+        unsigned                node_qp_eps;
         uct_xrc_verbs_ini_scope_t ini_scope;
     } config;
 } uct_xrc_verbs_iface_t;
